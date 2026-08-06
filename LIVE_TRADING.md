@@ -20,6 +20,12 @@ An order can only reach the venue when all three are open:
 The dashboard shows which locks are open under **Runtime & keys**. Removing any
 one of them stops live orders immediately.
 
+The third lock cannot be pre-opened. The engine always boots in Paper — no
+config value selects Live at startup, and `mode` is never persisted — so a
+redeploy, a crash-restart, or a fresh container comes back simulated and waits
+for someone to switch it. On a hosted instance that is the difference between
+restarting and quietly resuming real orders unattended.
+
 ## Before you enable it
 
 **Read the code you are about to trust.** It is one file:

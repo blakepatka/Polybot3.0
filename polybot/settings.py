@@ -228,8 +228,13 @@ class Runtime:
     def from_config(cls, cfg: dict[str, Any]) -> "Runtime":
         """Build runtime state, preferring persisted slider values."""
         sizing = cfg["sizing"]
-        engine = cfg["engine"]
-        mode = engine.get("autostart_mode", "paper")
+        # A fresh process always comes up in Paper, whatever ``autostart_mode``
+        # says. Live is a decision an operator takes at the dashboard against a
+        # process they are watching — never a state a restart can restore on
+        # its own. A hosted deploy restarts on every push and on every crash,
+        # so any config-driven path to booting Live is a way to start placing
+        # real orders on a box nobody is looking at.
+        mode = "paper"
 
         runtime = cls(
             mode=mode,

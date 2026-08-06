@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import json
 import os
@@ -788,6 +789,54 @@ class LiveTradingGateTests(unittest.TestCase):
 
         self.assertFalse(state["ready"])
         self.assertIn("verified for V2", " ".join(state["blockers"]))
+
+    def test_runtime_boots_paper_even_when_config_asks_for_live(self):
+        """A restart must never be what puts the engine into Live.
+
+        Both locks are open here — the config asks for Live and the master
+        switch is on — and boot is still Paper. A hosted deploy restarts on
+        every push and every crash, so a config-driven path to booting Live
+        would place real orders on a box nobody is watching.
+        """
+        config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+        config["engine"]["autostart_mode"] = "live"
+
+        with (
+            patch("polybot.settings.load_runtime_limits", return_value={}),
+            patch("polybot.settings.live_trading_enabled", return_value=True),
+        ):
+            runtime = Runtime.from_config(config)
+
+        self.assertEqual(runtime.mode, "paper")
+
+    def test_autostart_ignores_live_autostart_mode(self):
+        """The server's boot path starts Paper regardless of configuration.
+
+        Read from the parsed tree rather than the raw text, so that prose
+        mentioning the rejected knob does not pass for enforcing it.
+        """
+        source = (ROOT / "polybot" / "server.py").read_text(encoding="utf-8")
+        lifespan = next(
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "lifespan"
+        )
+        literals = {
+            node.value
+            for node in ast.walk(lifespan)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        started = [
+            node
+            for node in ast.walk(lifespan)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "start"
+        ]
+
+        self.assertNotIn("autostart_mode", literals)
+        self.assertNotIn("live", literals)
+        self.assertEqual([c.args[0].value for c in started], ["paper"])
 
     def test_saved_slider_below_venue_minimum_is_clamped(self):
         config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))

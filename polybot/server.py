@@ -28,7 +28,6 @@ from . import vault
 from .engine import Engine
 from .settings import (
     ROOT,
-    live_trading_enabled,
     load_config,
     save_operator_limits,
     save_runtime_limits,
@@ -62,14 +61,16 @@ def create_app() -> FastAPI:
         # Autostart makes the dashboard useful the moment it loads: paper
         # trading begins on its own, which is what the operator wants in every
         # case except an explicit live session.
+        #
+        # Boot is always Paper, and deliberately does not consult
+        # ``autostart_mode`` or the live gate. Switching to Live is an
+        # operator action taken against a running process; a restart must
+        # never make it for them.
         autostart = config["engine"].get("autostart", True)
         if os.getenv("POLYBOT_AUTOSTART", "").strip() == "0":
             autostart = False
         if autostart:
-            mode = config["engine"].get("autostart_mode", "paper")
-            if mode == "live" and not live_trading_enabled():
-                mode = "paper"
-            await engine.start(mode)
+            await engine.start("paper")
         try:
             yield
         finally:

@@ -7,6 +7,7 @@
     "discovery_interval_seconds": 20.0,
     "spot_interval_seconds": 1.0,
     "autostart": true,
+    "_autostart_mode_note": "Retained for schema compatibility and ignored: boot is always Paper. Setting it to 'live' does nothing. Live is an operator action taken at the dashboard against a running process, so that neither a redeploy nor a crash-restart can put an unattended box into Live.",
     "autostart_mode": "paper"
   },
 
