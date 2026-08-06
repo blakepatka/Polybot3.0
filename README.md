@@ -239,10 +239,44 @@ web/                    dashboard (no build step, no dependencies)
 
 ## Security
 
-The server has **no authentication** and can hold a wallet key. It binds to
-loopback and refuses any other interface unless you pass
-`--i-understand-the-risk`. Do not put it behind a tunnel or reverse proxy
-without adding auth first.
+The server can start the engine, move every risk limit, and hold a wallet key.
+On loopback it authenticates nobody, so it refuses any other interface — a
+routable bind without a password is a remote control for a funded bot.
+
+Set `POLYBOT_PASSWORD` and every route moves behind HTTP Basic (any username;
+`/healthz` stays open so a platform healthcheck can reach it), and the bind is
+then permitted. `--i-understand-the-risk` still forces a bind through without a
+password, for a host that is private by other means.
+
+That password is the only thing between the public internet and the engine.
+There is no rate limiting, no lockout, and no second factor. Use a long random
+value, and serve it over TLS only — Basic auth sends the password on every
+request.
+
+## Deploying
+
+`railway.json` builds with Nixpacks and starts `python run.py --host 0.0.0.0`,
+which picks up the platform's `$PORT`. Two things need setting beyond that:
+
+| Variable | Why |
+|---|---|
+| `POLYBOT_PASSWORD` | Required. Without it the launcher refuses the bind. |
+| `POLYBOT_DATA_DIR` | Point at a mounted volume, e.g. `/data`. |
+| `POLYBOT_ENV_FILE` | Point at the same volume, e.g. `/data/.env`. |
+
+The last two matter more than they look. A container's filesystem is rebuilt on
+every deploy, so with the defaults the SQLite ledger — every position, every
+settlement, the entire measured record — and any credentials saved from the
+dashboard are discarded on each push. A volume keeps them.
+
+Run **one replica**. Two instances share no state and would both trade the same
+windows against the same bankroll, so the per-window and daily caps would each
+be enforced twice over rather than once.
+
+`LIVE_TRADING_ENABLED` is deliberately not part of a deploy checklist. Read
+[LIVE_TRADING.md](LIVE_TRADING.md) before it goes anywhere near a hosted
+instance: a cloud box you are not watching is the worst place to first exercise
+an order path that has never run against real funds.
 
 ## Disclaimer
 

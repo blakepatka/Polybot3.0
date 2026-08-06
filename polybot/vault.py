@@ -113,6 +113,9 @@ def _write_env_file(path: Path, values: dict[str, str]) -> None:
         lines += ["", "# Other settings"]
         lines += [f"{k}={existing[k]}" for k in extra]
 
+    # POLYBOT_ENV_FILE may point outside the repo — at a mounted volume, say —
+    # where the directory is not guaranteed to exist yet.
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     # Best-effort: strip group/other access. No-op semantics differ on Windows,

@@ -1,15 +1,20 @@
 """FastAPI application: REST control plane, SSE telemetry, static dashboard.
 
-The server binds to loopback by default. Nothing here authenticates callers, so
-exposing it on a routable interface would hand anyone on the network control of
-a bot holding wallet credentials — see the bind guard in ``run.py``.
+The server binds to loopback by default and, there, authenticates nobody. Set
+``POLYBOT_PASSWORD`` to put every route behind HTTP Basic; the bind guard in
+``run.py`` requires it before it will serve a routable interface, because
+otherwise the exposed surface is engine control over a bot holding wallet
+credentials.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import os
+import secrets
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -75,6 +80,53 @@ def create_app() -> FastAPI:
     app.state.engine = engine
     app.state.store = store
     app.state.config = config
+
+    # ---- auth -----------------------------------------------------------
+
+    password = os.getenv("POLYBOT_PASSWORD", "").strip()
+
+    # Unauthenticated endpoints. The platform healthcheck has to answer before
+    # a deploy is routed anywhere, so it cannot sit behind the password; it
+    # reports liveness only and exposes no position, credential or P/L data.
+    AUTH_EXEMPT = {"/healthz"}
+
+    def _password_ok(header: str | None) -> bool:
+        """Check an HTTP Basic header. The username is ignored."""
+        if not header or not header.startswith("Basic "):
+            return False
+        try:
+            decoded = base64.b64decode(header[6:], validate=True).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            return False
+        _, sep, supplied = decoded.partition(":")
+        if not sep:
+            return False
+        return secrets.compare_digest(supplied, password)
+
+    @app.middleware("http")
+    async def require_password(request: Request, call_next):
+        """Gate every route behind a shared password when one is configured.
+
+        Nothing else in this process authenticates, and the dashboard can start
+        the engine, move every risk limit and read the credential vault. On
+        loopback that is acceptable; on a routable interface it is a remote
+        control for a funded bot, so ``run.py`` refuses such a bind unless this
+        password is set.
+
+        Basic auth specifically, because the browser then attaches the
+        credential to fetch and EventSource itself — the SSE telemetry stream
+        cannot carry a custom header, and a cookie/login page would need one.
+        Set no password and the gate disappears, preserving local behaviour.
+        """
+        if not password or request.url.path in AUTH_EXEMPT:
+            return await call_next(request)
+        if _password_ok(request.headers.get("authorization")):
+            return await call_next(request)
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Authentication required."},
+            headers={"WWW-Authenticate": 'Basic realm="Polybot", charset="UTF-8"'},
+        )
 
     # ---- state ---------------------------------------------------------
 

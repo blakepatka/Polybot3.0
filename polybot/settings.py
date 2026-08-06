@@ -24,8 +24,12 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ROOT / "config.json"
-DATA_DIR = ROOT / "data"
-ENV_PATH = ROOT / ".env"
+
+# Both paths are overridable so a container deploy can point them at a mounted
+# volume. A container's own filesystem is rebuilt on every deploy, which would
+# otherwise discard the SQLite ledger and the saved credentials on each push.
+DATA_DIR = Path(os.getenv("POLYBOT_DATA_DIR") or (ROOT / "data"))
+ENV_PATH = Path(os.getenv("POLYBOT_ENV_FILE") or (ROOT / ".env"))
 OPERATOR_LIMITS_PATH = DATA_DIR / "operator_limits.json"
 
 # Assets Polymarket currently runs Up-or-Down windows on, mapped to the ticker
