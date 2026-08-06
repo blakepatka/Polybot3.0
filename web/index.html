@@ -1,0 +1,781 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Polybot 3.0 — Polymarket short-window engine</title>
+<link rel="stylesheet" href="/static/styles.css?v=night-sands-12">
+<link rel="stylesheet" href="/static/border-glow.css?v=3">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>📈</text></svg>">
+</head>
+<body>
+
+<div id="iridescence" class="iridescence-container" aria-hidden="true"></div>
+<div id="dot-field" class="dot-field-container" aria-hidden="true"></div>
+<div id="toasts" class="toasts"></div>
+
+<div class="foot" role="status" aria-live="polite">
+  <span id="foot-conn" class="dot-off">● disconnected</span>
+  <span id="foot-mode">paper</span>
+  <span id="foot-loop">—</span>
+  <span id="foot-time">—</span>
+</div>
+
+<!-- ── control bar ─────────────────────────────────────────────────────── -->
+<header class="controlbar">
+  <div class="ctl-group">
+    <div class="ctl-label">Engine control</div>
+    <div class="ctl-row">
+      <button id="btn-power" class="btn btn-start">
+        <span class="glyph">▶</span><span id="power-text">Start bot</span>
+      </button>
+      <span id="engine-status" class="engine-status">Engine offline</span>
+    </div>
+  </div>
+
+  <div class="ctl-divider"></div>
+
+  <div class="ctl-group">
+    <div class="ctl-label">Execution mode</div>
+    <div class="seg" id="mode-seg">
+      <button class="seg-btn active" data-mode="paper">Paper</button>
+      <button class="seg-btn" data-mode="live">Live</button>
+    </div>
+  </div>
+
+  <div class="ctl-divider"></div>
+
+
+  <div class="ctl-group grow">
+    <div class="slider-row">
+      <label class="ctl-label" for="sl-trade">Maximum per trade</label>
+      <span class="slider-val" id="val-trade">$5.00</span>
+    </div>
+    <input type="range" id="sl-trade" min="5" max="65" step="1" value="5">
+    <div class="slider-row">
+      <label class="ctl-label" for="sl-window"
+        title="Combined stake across every asset sharing the same 5-minute or 15-minute interval">
+        Maximum per window · all assets
+      </label>
+      <span class="slider-val" id="val-window">$25.00</span>
+    </div>
+    <input type="range" id="sl-window" min="5" max="250" step="5" value="25">
+  </div>
+
+  <div class="ctl-divider"></div>
+
+  <div class="ctl-group">
+    <div class="ctl-label">Credentials</div>
+    <button id="btn-vault" class="btn btn-ghost">
+      API vault · <span id="vault-chip">empty</span> <span class="caret">▾</span>
+    </button>
+  </div>
+</header>
+
+<!-- ── tabs ────────────────────────────────────────────────────────────── -->
+<nav class="tabs" id="tabs">
+  <button class="tab active" data-tab="overview">Overview</button>
+  <button class="tab" data-tab="monitor">Model monitor</button>
+  <button class="tab" data-tab="winloss">Wins &amp; losses</button>
+  <button class="tab" data-tab="controls">Runtime &amp; keys</button>
+</nav>
+
+<main>
+
+<!-- ══ OVERVIEW ═══════════════════════════════════════════════════════════ -->
+<section class="pane active" id="pane-overview">
+
+  <div class="grid-2">
+    <!-- P/L -->
+    <div class="card pnl-card">
+      <div class="card-head">
+        <div class="card-title"><span id="pnl-arrow" class="arrow up">▲</span> Estimated settled trading P/L</div>
+        <div class="range" id="range-tabs">
+          <button data-range="1h">1H</button>
+          <button data-range="5h">5H</button>
+          <button data-range="12h">12H</button>
+          <button data-range="24h">24H</button>
+          <button data-range="7d">7D</button>
+          <button data-range="all" class="active">ALL</button>
+        </div>
+      </div>
+      <div class="pnl-big" id="pnl-total">$0.00</div>
+      <div class="pnl-sub" id="pnl-sub">0 settlements · all settled windows</div>
+      <div class="wallet-strip" id="wallet-strip" aria-live="polite">
+        <div>
+          <div class="wallet-label" id="pnl-wallet-label">Polymarket account equity</div>
+          <div class="wallet-note" id="pnl-wallet-note">Checking live pUSD collateral…</div>
+        </div>
+        <div class="wallet-value" id="pnl-wallet">—</div>
+      </div>
+      <div class="chart-wrap" id="chart-wrap" tabindex="0" role="img"
+           aria-label="Interactive cumulative local settlement estimate. Hover, tap, or use the arrow keys to inspect settlements.">
+        <svg id="chart" preserveAspectRatio="none" aria-hidden="true"></svg>
+        <div class="chart-empty" id="chart-empty">Waiting for the first settled window…</div>
+        <div class="chart-tip" id="chart-tip" hidden></div>
+        <div class="chart-hint">Hover, tap, or use ← → to inspect</div>
+      </div>
+      <div class="tiles-4">
+        <div class="tile"><div class="tile-label">Win rate</div><div class="tile-val" id="m-winrate">—</div></div>
+        <div class="tile"><div class="tile-label">ROI / stake</div><div class="tile-val" id="m-roi">—</div></div>
+        <div class="tile"><div class="tile-label">Biggest win</div><div class="tile-val" id="m-best">—</div></div>
+        <div class="tile"><div class="tile-label">Open windows</div><div class="tile-val" id="m-open">0</div></div>
+      </div>
+    </div>
+
+    <!-- profile -->
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <div class="card-title" id="profile-title">Profile reconstruction (paper only)</div>
+          <div class="card-sub" id="profile-sub">—</div>
+        </div>
+        <span class="pill" id="profile-pill">OFFLINE</span>
+      </div>
+      <div class="tiles-grid" id="profile-tiles"></div>
+      <div class="quality" id="quality-box"></div>
+    </div>
+  </div>
+
+  <div class="note">
+    <span class="note-i">i</span>
+    <div><b>Rebates are excluded.</b> Polymarket pays account-tier taker rebates; this dashboard
+    counts trading P/L only, so an unearned tier cannot make paper results look profitable.</div>
+  </div>
+
+  <div class="card sm hourly-panel">
+    <div>
+      <div class="card-label">All-time earnings pace</div>
+      <div class="hourly-value" id="m-hourly">—</div>
+    </div>
+    <div class="hourly-detail" id="m-hourly-detail">
+      Waiting for enough settlement history to calculate an hourly average.
+    </div>
+  </div>
+
+  <div class="grid-3">
+    <div class="card sm">
+      <div class="card-label" id="entry-label">Paper entry restrictions</div>
+      <div class="card-h3" id="entry-assets">—</div>
+      <div class="card-note" id="entry-note">—</div>
+    </div>
+    <div class="card sm">
+      <div class="card-label">Active data sources</div>
+      <div class="card-h3" id="sources-line">—</div>
+      <div class="card-note" id="sources-latency">—</div>
+    </div>
+    <div class="card sm">
+      <div class="card-label">Candidate model trust</div>
+      <div class="card-h3" id="trust-line">—</div>
+      <div class="card-note" id="trust-note">—</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <div class="subtabs" id="pos-subtabs">
+        <button class="subtab active" data-sub="positions">Positions <span class="count" id="cnt-pos">0</span></button>
+        <button class="subtab" data-sub="activity">Activity <span class="count" id="cnt-act">0</span></button>
+      </div>
+      <select id="asset-filter" class="select"><option value="">All assets</option></select>
+    </div>
+    <div id="sub-positions">
+      <table class="tbl">
+        <thead><tr>
+          <th>Market</th><th>Side / confidence</th><th class="r">Average</th>
+          <th class="r">Staked</th><th class="r">Price status</th>
+        </tr></thead>
+        <tbody id="tb-positions"><tr class="empty"><td colspan="5">No open positions.</td></tr></tbody>
+      </table>
+    </div>
+    <div id="sub-activity" class="hidden">
+      <table class="tbl">
+        <thead><tr><th style="width:150px">Time</th><th style="width:110px">Event</th><th>Detail</th></tr></thead>
+        <tbody id="tb-activity"><tr class="empty"><td colspan="3">No activity yet.</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="price-row" id="price-row"></div>
+
+  <div class="card" id="maker-card">
+    <div class="card-head">
+      <div>
+        <div class="card-label">Two-sided book — locked pairs</div>
+        <div class="card-h2">Market making</div>
+        <div class="card-note">A share of Up and a share of Down together always pay exactly $1.
+          Acquired for less than that, the difference is locked profit with <b>no directional risk</b>.
+          Measured on live books: unreachable by crossing the spread (0 of 532 samples), available at
+          the bid every time. <b>Residual</b> is unpaired inventory — the only real exposure here, and
+          the engine re-quotes to flatten it.</div>
+      </div>
+      <span class="pill" id="maker-pill">—</span>
+    </div>
+
+    <div class="metricrow" id="maker-metrics"></div>
+
+    <div class="subtabs mt" id="maker-subtabs">
+      <button class="subtab active" data-mk="inventory">Inventory <span class="count" id="cnt-inv">0</span></button>
+      <button class="subtab" data-mk="quotes">Resting quotes <span class="count" id="cnt-q">0</span></button>
+    </div>
+
+    <div id="mk-inventory">
+      <table class="tbl">
+        <thead><tr>
+          <th>Market</th><th class="r">Up</th><th class="r">Down</th>
+          <th class="r">Pair cost</th><th style="width:170px">Locked</th>
+          <th class="r">Locked P/L</th><th>Residual</th><th class="r">Left</th>
+        </tr></thead>
+        <tbody id="tb-maker"><tr class="empty"><td colspan="8">No maker inventory yet.</td></tr></tbody>
+      </table>
+    </div>
+
+    <div id="mk-quotes" class="hidden">
+      <table class="tbl">
+        <thead><tr>
+          <th>Market</th><th>Side</th><th class="r">Bid</th><th class="r">Size</th>
+          <th class="r">Shares</th><th class="r">Resting</th>
+        </tr></thead>
+        <tbody id="tb-quotes"><tr class="empty"><td colspan="6">No resting quotes.</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="card-note mt" id="maker-note"></div>
+  </div>
+
+</section>
+
+<!-- ══ MODEL MONITOR ══════════════════════════════════════════════════════ -->
+<section class="pane" id="pane-monitor">
+  <div class="metricrow" id="metricrow"></div>
+
+  <div class="grid-2 monitor-grid">
+    <div class="card collapsible-card" id="live-signals-card">
+      <div class="card-head collapse-head">
+        <div class="card-label">Live signals</div>
+        <button class="collapse-toggle" id="toggle-live-signals" type="button"
+                aria-expanded="true" aria-controls="live-signals-body">
+          <span class="collapse-label">Collapse</span><span class="collapse-chevron">⌃</span>
+        </button>
+      </div>
+      <div class="collapse-body" id="live-signals-body">
+        <div class="collapse-inner">
+      <div class="card-note mb">Every window the model scored on its last pass. A rejected signal
+        shows the first gate it failed — the engine stops evaluating at that point.
+        Signals are deleted when they reach 24 hours old.</div>
+      <table class="tbl">
+        <thead><tr>
+          <th>Market</th><th>Side</th><th class="r">Confidence</th><th class="r">Ask</th>
+          <th class="r">Exp. ROI</th><th class="r">Drift</th><th class="r">Left</th><th>Gate</th>
+        </tr></thead>
+        <tbody id="tb-signals"><tr class="empty"><td colspan="8">Waiting for the first scan…</td></tr></tbody>
+      </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Why entries were declined</div>
+      <div class="card-note mb">Rejection counts since the engine started. A healthy run is dominated
+        by pricing gates, not by data or depth failures.</div>
+      <div id="rejections"></div>
+
+      <div class="card-label mt">Engine telemetry</div>
+      <div class="tiles-grid" id="telemetry"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <div>
+        <div class="card-label">Data sources &amp; latency</div>
+        <div class="card-note">Every external endpoint the engine depends on, what it feeds, and how
+          long its last round trip took. Latency is wall-clock for the whole batched pass, not per
+          request — the engine fans out concurrently, so this is the time the loop actually waited.</div>
+      </div>
+      <span class="pill" id="src-pill">—</span>
+    </div>
+    <table class="tbl">
+      <thead><tr>
+        <th style="width:34px"></th><th>Source</th><th>Feeds</th>
+        <th class="r" style="width:90px">Last poll</th><th style="width:190px">Latency</th>
+        <th class="r" style="width:90px">Coverage</th><th>Status</th>
+      </tr></thead>
+      <tbody id="tb-sources"><tr class="empty"><td colspan="7">Waiting for the first poll…</td></tr></tbody>
+    </table>
+    <div class="src-foot" id="src-foot"></div>
+  </div>
+</section>
+
+<!-- ══ WINS & LOSSES ══════════════════════════════════════════════════════ -->
+<section class="pane" id="pane-winloss">
+  <div class="wl-rangebar">
+    <div>
+      <div class="card-label">Wins &amp; losses time range</div>
+      <div class="card-note" id="wl-range-note">Summary and both tables cover all settled windows.</div>
+    </div>
+    <div class="range" id="wl-range-tabs" aria-label="Wins and losses time range">
+      <button data-wl-range="1h">1H</button>
+      <button data-wl-range="5h">5H</button>
+      <button data-wl-range="12h">12H</button>
+      <button data-wl-range="24h">24H</button>
+      <button data-wl-range="7d">7D</button>
+      <button data-wl-range="all" class="active">ALL</button>
+    </div>
+  </div>
+  <div class="wl-summary" id="wl-summary"></div>
+
+  <div class="card">
+    <div class="card-head">
+      <div>
+        <div class="card-label">Performance by asset &amp; window</div>
+        <div class="card-note">Sorted by P/L. The bar shows win rate; the marker is the 50% coin-flip line.</div>
+      </div>
+      <span class="pill" id="wl-pill">—</span>
+    </div>
+    <table class="tbl">
+      <thead><tr>
+        <th>Asset</th><th style="width:70px">Window</th><th class="r">Settled</th>
+        <th style="width:210px">Win rate</th><th class="r">Record</th>
+        <th class="r">Staked</th><th class="r">P/L</th><th class="r">ROI</th>
+      </tr></thead>
+      <tbody id="tb-byasset"><tr class="empty"><td colspan="8">No settled windows yet.</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <div>
+        <div class="card-label">Recent settlements</div>
+        <div class="card-note">Most recent first. <b>Anchor → close</b> is the spot move that decided the
+          window: Up wins when close is at or above anchor.</div>
+      </div>
+      <div class="seg" id="wl-filter">
+        <button class="seg-btn active" data-wl="all">All</button>
+        <button class="seg-btn" data-wl="win">Wins</button>
+        <button class="seg-btn" data-wl="loss">Losses</button>
+      </div>
+    </div>
+    <table class="tbl">
+      <thead><tr>
+        <th style="width:44px"></th><th>Market</th><th style="width:80px">Side</th>
+        <th class="r">Entry</th><th class="r">Staked</th><th class="r">P/L</th>
+        <th>Anchor → close</th><th class="r">Settled</th>
+      </tr></thead>
+      <tbody id="tb-settlements"><tr class="empty"><td colspan="8">No settled windows yet.</td></tr></tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ══ RUNTIME & KEYS ═════════════════════════════════════════════════════ -->
+<section class="pane" id="pane-controls">
+  <div class="grid-2">
+
+    <div class="card">
+      <div class="card-head">
+        <div><div class="card-label">Runtime trading control</div>
+        <div class="card-h2">Pause, resume, panic</div></div>
+        <span class="pill" id="trading-pill">TRADING</span>
+      </div>
+      <div class="btn-row">
+        <button id="btn-pause" class="btn btn-wide">Pause trading</button>
+        <button id="btn-panic" class="btn btn-wide btn-danger">Panic: sell all &amp; pause</button>
+      </div>
+      <div class="card-note">Panic sells all <b id="panic-count">0</b> open positions into the resting
+        bids at whatever they fetch, then pauses. Positions with no bid to hit stay open and settle normally.</div>
+
+      <div class="regime" id="regime-box">
+        <div class="card-label">Market regime</div>
+        <div class="regime-state" id="regime-state">—</div>
+        <div class="card-note" id="regime-note">—</div>
+      </div>
+
+      <div class="vol-row" id="vol-row"></div>
+      <div class="card-note" id="vol-note">—</div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div><div class="card-label">Runtime risk control</div>
+        <div class="card-h2">Max amount per trade</div></div>
+        <span class="pill ok" id="risk-pill">APPLIED</span>
+      </div>
+      <div class="big-money"><span id="big-trade">$5.00</span> <span class="unit">per clip</span></div>
+      <input type="range" id="sl-trade2" min="5" max="65" step="1" value="5" class="big-slider">
+      <div class="range-ends"><span>$5.00</span><span>$65.00</span></div>
+      <div class="card-note" id="trade-limit-note">A hard ceiling on any one clip. Entries and reversals are sized from the
+        base clip. Applies to the next clip and is shared by Paper and Live across
+        restarts. Polymarket's minimum order is $5, so the control cannot be set below that.</div>
+
+      <div class="card-label mt">Daily cap</div>
+      <div class="big-money sm"><span id="big-daily">$500.00</span> <span class="unit">per UTC day</span></div>
+      <input type="range" id="sl-daily" min="50" max="25000" step="50" value="500" class="big-slider">
+      <div class="range-ends"><span>$50</span><span>$25,000</span></div>
+      <div class="card-note" id="daily-limit-note">Total stake the engine may deploy per UTC day, across every asset.
+        Paper and Live use the same ceiling, including while an entry override is active. Resets at 00:00 UTC.</div>
+    </div>
+  </div>
+
+  <div class="card" id="limits-card">
+    <div class="card-head">
+      <div>
+        <div class="card-label">All active trading limits</div>
+        <div class="card-h2">Bankroll, exposure, and entry filters</div>
+        <div class="card-note">These values control the actual mandatory gates in both Paper and Live and persist across restarts.</div>
+      </div>
+      <span class="pill ok" id="limits-pill">SAVED</span>
+    </div>
+
+    <div class="limit-grid" id="limit-grid">
+      <label class="limit-field" for="lim-bankroll">
+        <span>Declared bankroll</span>
+        <input id="lim-bankroll" class="fld" type="number" min="5" max="1000000" step="1">
+        <small>Total capital the strategy is allowed to plan around.</small>
+      </label>
+      <label class="limit-field" for="lim-trade">
+        <span>Maximum per trade</span>
+        <input id="lim-trade" class="fld" type="number" min="5" max="1000" step="1">
+        <small>Cannot be below Polymarket's $5 minimum.</small>
+      </label>
+      <label class="limit-field" for="lim-window">
+        <span>All-market interval cap</span>
+        <input id="lim-window" class="fld" type="number" min="5" max="5000" step="5">
+        <small>Combined across every asset ending in the same 5m or 15m interval.</small>
+      </label>
+      <label class="limit-field" for="lim-market-window">
+        <span>Maximum per market/window</span>
+        <input id="lim-market-window" class="fld" type="number" min="5" max="5000" step="5">
+        <small>Maximum total stake in one exact market, such as BTC 5m. Cannot exceed the all-market interval cap.</small>
+      </label>
+      <label class="limit-field" for="lim-open">
+        <span>Total open exposure</span>
+        <input id="lim-open" class="fld" type="number" min="5" max="1000000" step="5">
+        <small>Maximum capital committed across all open positions.</small>
+      </label>
+      <label class="limit-field" for="lim-reserve">
+        <span>Implied cash reserve</span>
+        <input id="lim-reserve" class="fld" type="number" readonly>
+        <small>Bankroll minus total open exposure; calculated automatically.</small>
+      </label>
+      <label class="limit-field" for="lim-loss">
+        <span>Daily realized-loss stop</span>
+        <input id="lim-loss" class="fld" type="number" min="1" max="1000000" step="1">
+        <small>Blocks new entries after this net loss in the active UTC day.</small>
+      </label>
+      <label class="limit-field" for="lim-daily">
+        <span>Daily turnover cap</span>
+        <input id="lim-daily" class="fld" type="number" min="5" max="100000" step="25">
+        <small>Total stake deployed per UTC day; reaching it blocks entries until the UTC reset.</small>
+      </label>
+      <label class="limit-field" for="lim-confidence">
+        <span>Minimum confidence (%)</span>
+        <input id="lim-confidence" class="fld" type="number" min="62" max="99" step="1">
+        <small>Hard floor: the dashboard and server will not accept less than 62%.</small>
+      </label>
+      <label class="limit-field" for="lim-price">
+        <span>Maximum entry price (¢)</span>
+        <input id="lim-price" class="fld" type="number" min="1" max="99" step="1">
+        <small>Rejects entries priced above this many cents.</small>
+      </label>
+      <label class="limit-field" for="lim-timing">
+        <span>Latest entry point (%)</span>
+        <input id="lim-timing" class="fld" type="number" min="5" max="100" step="5">
+        <small>Entries stop after this percentage of the market window has elapsed.</small>
+      </label>
+    </div>
+    <div class="btn-row limit-actions">
+      <button id="btn-save-limits" class="btn btn-wide">Save all limits</button>
+      <span class="card-note" id="limits-status">Paper and Live use the same values.</span>
+    </div>
+  </div>
+
+  <!-- credentials -->
+  <div class="card" id="vault-card">
+    <div class="card-head">
+      <div><div class="card-label">Live CLOB v2 access</div>
+      <div class="card-h2">Trading credentials</div></div>
+      <span class="pill" id="vault-pill">NOT LOADED</span>
+    </div>
+
+    <details class="metamask-guide" open>
+      <summary>
+        <span>
+          <span class="guide-kicker">Step-by-step</span>
+          Wallet &amp; CLOB key setup
+        </span>
+        <span class="guide-summary-note">The dashboard can derive the CLOB keys for you</span>
+      </summary>
+
+      <div class="guide-body">
+        <div class="guide-security">
+          <strong>Use a dedicated MetaMask account with limited funds.</strong>
+          Its private key gives complete control of that account. Never paste a Secret Recovery
+          Phrase here, never share the key with another person, and close screen-sharing or
+          recording software before revealing it.
+        </div>
+
+        <div class="signature-choice">
+          <div class="signature-option recommended">
+            <div class="signature-heading">
+              <span class="guide-number">2</span>
+              <div>
+                <strong>MetaMask connected to Polymarket.com</strong>
+                <span class="guide-tag">Typical existing account</span>
+              </div>
+            </div>
+            <p>Select <b>signature type 2</b>. Paste the address shown in
+              <a href="https://polymarket.com/settings" target="_blank" rel="noopener noreferrer">Polymarket Settings ↗</a>
+              into <b>Funder / proxy address</b>. This is normally different from the public address
+              displayed in MetaMask because the funds are held by the account's Polymarket Safe.</p>
+          </div>
+
+          <div class="signature-option">
+            <div class="signature-heading">
+              <span class="guide-number">0</span>
+              <div>
+                <strong>Standalone MetaMask EOA</strong>
+                <span class="guide-tag">Direct wallet trading</span>
+              </div>
+            </div>
+            <p>Select <b>signature type 0</b> only when the trading funds are held directly at the
+              MetaMask EVM address. Leave the funder field blank; the app will use the address
+              derived from the private key. The wallet may need POL for Polygon gas.</p>
+          </div>
+        </div>
+
+        <ol class="guide-steps">
+          <li>
+            <div class="guide-step-title">Choose the exact MetaMask account</div>
+            <p>Open MetaMask and switch to the account that controls the Polymarket account or the
+              standalone funds. Do not use a different account from the one originally connected
+              to Polymarket.</p>
+          </li>
+          <li>
+            <div class="guide-step-title">Copy the EOA public address</div>
+            <p>Open the account selector, choose the three-dot menu, then <b>Account details</b>.
+              Copy the Ethereum/EVM address beginning with <code>0x</code> and paste it into
+              <b>Wallet address</b>. This field is optional, but filling it lets the dashboard
+              verify that the private key below belongs to the same account.
+              <a href="https://support.metamask.io/configure/accounts/how-to-view-your-account-details-and-public-address/"
+                target="_blank" rel="noopener noreferrer">Official address guide ↗</a></p>
+          </li>
+          <li>
+            <div class="guide-step-title">Export that account's private key</div>
+            <p>In <b>Account details</b>, select <b>Private key</b>, enter the MetaMask password,
+              and hold to reveal it. Copy the individual account key beginning with <code>0x</code>
+              into <b>EOA private key</b>. Do not enter the 12/24-word Secret Recovery Phrase.
+              <a href="https://support.metamask.io/configure/accounts/how-to-export-an-accounts-private-key/"
+                target="_blank" rel="noopener noreferrer">Official export guide ↗</a></p>
+          </li>
+          <li>
+            <div class="guide-step-title">Set the funder and signature type</div>
+            <p>For the usual MetaMask-connected Polymarket account, copy the profile address from
+              Polymarket Settings into <b>Funder / proxy address</b> and select
+              <b>2 — legacy MetaMask / Polymarket Safe</b>. Accounts using Polymarket's newer
+              V2 deposit-wallet flow use type 3. For a standalone EOA, leave the funder blank and
+              select type 0. The signer key, funder, and signature type must describe the same
+              account structure.</p>
+          </li>
+          <li>
+            <div class="guide-step-title">Let the dashboard create the CLOB credentials</div>
+            <p>Keep <b>Verify against Polymarket</b> checked and leave the CLOB API key, secret,
+              and passphrase fields all blank. Click <b>Validate &amp; save</b>. The dashboard uses
+              the private key for L1 authentication, creates or derives the three L2 values
+              together, verifies them with Polymarket, and stores them locally. If you already
+              generated credentials elsewhere, paste all three values—never only one or two.
+              <a href="https://docs.polymarket.com/api-reference/authentication#getting-api-credentials"
+                target="_blank" rel="noopener noreferrer">Polymarket authentication guide ↗</a></p>
+          </li>
+          <li>
+            <div class="guide-step-title">Restart and verify before enabling live orders</div>
+            <p>Restart the engine so it reloads the saved values, return to this tab, and use
+              <b>Check pUSD balance</b>. Confirm the address and balance belong to the intended
+              account before switching to Live mode. Saving credentials alone does not enable
+              live trading.</p>
+          </li>
+        </ol>
+
+        <div class="guide-troubleshooting">
+          <div class="card-label">Common setup errors</div>
+          <ul>
+            <li><b>Private key derives a different address:</b> the Wallet address came from a
+              different MetaMask account. Switch accounts and repeat steps 2–3.</li>
+            <li><b>Invalid signature or funder:</b> type 0/2 does not match where the funds live,
+              or the Polymarket profile address was not used as the type-2 funder.</li>
+            <li><b>Partial CLOB credentials:</b> clear all three L2 fields and derive them, or
+              supply the API key, secret, and passphrase as one complete set.</li>
+          </ul>
+        </div>
+      </div>
+    </details>
+
+    <div class="clob-quickstart">
+      <div class="clob-quickstart-title">Fastest option: leave all three CLOB fields blank</div>
+      <p>Enter the wallet details below, keep <b>Verify against Polymarket</b> checked, then click
+        <b>Derive, validate &amp; save</b>. The dashboard uses the wallet key once to create or
+        recover the matching API key, secret, and passphrase, then stores the complete set locally.</p>
+      <p>You do not copy these three values from the Polymarket website. If you already generated
+        them with Polymarket's SDK, paste all three as one set.</p>
+      <p><b>CLOB V2:</b> Polymarket replaced USDC.e collateral with pUSD in April 2026. Old CLOB
+        credentials are not accepted by V2. If this vault was configured before the migration,
+        use <b>Re-derive V2 CLOB keys</b> below. Polymarket's website wraps deposits into pUSD;
+        API-only wallets must wrap USDC.e through the Collateral Onramp.</p>
+      <a href="https://docs.polymarket.com/api-reference/authentication#getting-api-credentials"
+         target="_blank" rel="noopener noreferrer">Official CLOB credential instructions ↗</a>
+      ·
+      <a href="https://docs.polymarket.com/v2-migration"
+         target="_blank" rel="noopener noreferrer">CLOB V2 migration guide ↗</a>
+    </div>
+
+    <div class="grid-2 gap">
+      <div>
+        <div class="fld-label-row">
+          <label class="fld-label" for="f-pk">EOA private key</label>
+          <span class="credential-links">
+            <a href="https://polymarket.com/settings?tab=export-private-key" target="_blank" rel="noopener noreferrer">Polymarket export ↗</a>
+            <a href="https://support.metamask.io/configure/accounts/how-to-export-an-accounts-private-key/" target="_blank" rel="noopener noreferrer">MetaMask guide ↗</a>
+          </span>
+        </div>
+        <input id="f-pk" class="fld" type="password" placeholder="0x…" autocomplete="off" spellcheck="false">
+        <div class="fld-note">Signs orders locally; never leaves this machine.</div>
+
+        <div class="fld-label-row">
+          <label class="fld-label" for="f-addr">Wallet address (optional)</label>
+          <span class="credential-links">
+            <a href="https://support.metamask.io/configure/accounts/how-to-view-your-account-details-and-public-address/" target="_blank" rel="noopener noreferrer">Find wallet address ↗</a>
+          </span>
+        </div>
+        <input id="f-addr" class="fld" type="text" placeholder="0x… — verified against the key" autocomplete="off" spellcheck="false">
+        <div class="fld-note">If set, saving fails unless the key derives this address.</div>
+
+        <div class="fld-label-row">
+          <label class="fld-label" for="f-funder">Funder / proxy address (optional)</label>
+          <span class="credential-links">
+            <a href="https://polymarket.com/settings" target="_blank" rel="noopener noreferrer">View Polymarket address ↗</a>
+          </span>
+        </div>
+        <input id="f-funder" class="fld" type="text" placeholder="0x… — Polymarket UI wallet" autocomplete="off" spellcheck="false">
+        <div class="fld-note">The address holding your pUSD collateral. Leave blank to trade from the EOA itself.</div>
+
+        <div class="fld-label-row">
+          <label class="fld-label" for="f-sig">Signature type</label>
+          <span class="credential-links">
+            <a href="https://docs.polymarket.com/trading/overview#signature-types" target="_blank" rel="noopener noreferrer">Choose account type ↗</a>
+          </span>
+        </div>
+        <select id="f-sig" class="fld select">
+          <option value="0">0 — EOA (key holds the funds)</option>
+          <option value="1">1 — Legacy email / Magic proxy</option>
+          <option value="2">2 — Legacy MetaMask / Polymarket Safe</option>
+          <option value="3">3 — CLOB V2 deposit wallet (EIP-1271)</option>
+        </select>
+      </div>
+
+      <div>
+        <div class="fld-label-row">
+          <label class="fld-label" for="f-key">CLOB L2 API key</label>
+          <span class="credential-links">
+            <a href="https://docs.polymarket.com/api-reference/authentication#getting-api-credentials" target="_blank" rel="noopener noreferrer">Create or derive ↗</a>
+          </span>
+        </div>
+        <input id="f-key" class="fld" type="text" placeholder="UUID — leave blank to derive" autocomplete="off" spellcheck="false">
+        <div class="fld-note">Pre-derived Polymarket API credential. Blank derives one from your key.</div>
+
+        <div class="fld-label-row">
+          <label class="fld-label" for="f-secret">CLOB L2 secret</label>
+          <span class="credential-links">
+            <a href="https://docs.polymarket.com/api-reference/authentication#getting-api-credentials" target="_blank" rel="noopener noreferrer">Issued with API key ↗</a>
+          </span>
+        </div>
+        <input id="f-secret" class="fld" type="password" placeholder="base64" autocomplete="off" spellcheck="false">
+        <div class="fld-note">URL-safe base64 HMAC secret. Leave all three L2 fields blank to derive them together.</div>
+
+        <div class="fld-label-row">
+          <label class="fld-label" for="f-pass">CLOB L2 passphrase</label>
+          <span class="credential-links">
+            <a href="https://docs.polymarket.com/api-reference/authentication#getting-api-credentials" target="_blank" rel="noopener noreferrer">Issued with API key ↗</a>
+          </span>
+        </div>
+        <input id="f-pass" class="fld" type="password" placeholder="passphrase" autocomplete="off" spellcheck="false">
+        <div class="fld-note">Sent only inside signed CLOB requests. It is generated with the key and secret.</div>
+
+        <label class="chk"><input type="checkbox" id="f-verify" checked>
+          <span>Verify against Polymarket before saving</span></label>
+      </div>
+    </div>
+
+    <div class="btn-row mt">
+      <button id="btn-save-keys" class="btn btn-start">Derive, validate &amp; save</button>
+      <button id="btn-refresh-clob" class="btn btn-ghost">Re-derive V2 CLOB keys</button>
+      <button id="btn-clear-keys" class="btn btn-ghost">Clear vault</button>
+      <button id="btn-balance" class="btn btn-ghost">Check pUSD balance</button>
+    </div>
+    <div class="card-note">Keys are validated locally, stored only in the gitignored <code>.env</code>
+      on this machine, and never shown or logged. Applying them requires an engine restart.</div>
+    <div id="vault-msg"></div>
+
+    <div class="chainlink-box">
+      <div class="card-head">
+        <div>
+          <div class="card-label">Chainlink Data Streams</div>
+          <div class="card-h2">Resolution-source feed</div>
+          <div class="card-note">These markets resolve against Chainlink, not against Coinbase or
+            Kraken. Supplying Data Streams credentials makes the engine anchor, measure volatility
+            and settle on <b>the exact series the venue uses</b>, removing the basis error entirely —
+            and pushes rather than polls, so it is lower latency. Read-only market data: these keys
+            cannot move funds.</div>
+        </div>
+        <span class="pill" id="cl-pill">NOT CONFIGURED</span>
+      </div>
+
+      <div class="grid-2 gap">
+        <div>
+          <div class="fld-label-row">
+            <label class="fld-label" for="cl-key">Streams User ID (lowercase)</label>
+            <span class="credential-links">
+              <a href="https://docs.chain.link/data-streams/sign-up" target="_blank" rel="noopener noreferrer">Get credentials ↗</a>
+            </span>
+          </div>
+          <input id="cl-key" class="fld" type="text" placeholder="client id" autocomplete="off" spellcheck="false">
+        </div>
+        <div>
+          <div class="fld-label-row">
+            <label class="fld-label" for="cl-secret">Data Streams API secret</label>
+            <span class="credential-links">
+              <a href="https://docs.chain.link/data-streams/sign-up" target="_blank" rel="noopener noreferrer">Generate secret ↗</a>
+            </span>
+          </div>
+          <input id="cl-secret" class="fld" type="password" placeholder="user secret" autocomplete="off" spellcheck="false">
+        </div>
+      </div>
+
+      <div class="btn-row mt">
+        <button id="btn-cl-save" class="btn btn-start">Connect &amp; discover feeds</button>
+        <button id="btn-cl-clear" class="btn btn-ghost">Clear</button>
+      </div>
+      <div id="cl-msg" class="card-note"></div>
+      <table class="tbl" id="cl-table">
+        <thead><tr><th>Asset</th><th>Feed ID</th><th class="r">Price</th>
+          <th class="r">Stream latency</th><th class="r">Age</th></tr></thead>
+        <tbody id="tb-chainlink"><tr class="empty"><td colspan="5">No feeds connected.</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="warnbox" id="live-warn">
+      <b id="live-gate-title">Live trading gate</b>
+      <div id="live-gate-note">The bot remains in paper mode until Live is explicitly selected.
+        The live order path in this build has never been executed against real funds—read
+        <code>LIVE_TRADING.md</code> first.</div>
+      <div id="live-blockers" class="blockers"></div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<script src="/static/iridescence.js"></script>
+<script src="/static/dot-field.js"></script>
+<script src="/static/border-glow.js?v=3"></script>
+<script src="/static/app.js?v=market-window-cap-1"></script>
+</body>
+</html>

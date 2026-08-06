@@ -1,0 +1,26 @@
+# Credentials — NEVER commit. The vault writes here.
+.env
+.env.*
+!.env.example
+
+# Runtime state
+data/
+logs/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
