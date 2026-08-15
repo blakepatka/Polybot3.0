@@ -1008,7 +1008,7 @@ class Engine:
 
             strat.record_fill(
                 market.slug, intent.side, fill.stake_usd, fill.shares,
-                intent.stage, now,
+                intent.stage, now, intent.lock_profit_usd,
             )
             self.risk.record_entry(now)
             self.stats.entries += 1
@@ -1033,15 +1033,25 @@ class Engine:
                 strategy=strat.NAME,
             )
             self.store.log(
-                mode, "entry",
+                mode, "lock" if intent.is_lock else "entry",
                 f"{market.asset.upper()} {market.window} {intent.side.upper()} "
-                f"{intent.stage} {intent.confidence:.0%} @ {fill.avg_price:.2f} · "
-                f"${fill.stake_usd:.2f} staked",
+                + (
+                    f"LOCK +${intent.lock_profit_usd:.2f} guaranteed @ "
+                    f"{fill.avg_price:.2f} · ${fill.stake_usd:.2f} staked"
+                    if intent.is_lock else
+                    f"{intent.stage} {intent.confidence:.0%} @ {fill.avg_price:.2f} · "
+                    f"${fill.stake_usd:.2f} staked"
+                ),
                 asset=market.asset, slug=market.slug,
                 detail=(
-                    f"edge {intent.edge:+.3f}, fill #{intent.fill_index + 1}, "
-                    f"fee ${fill.fee_usd:.4f}, "
-                    f"{intent.seconds_into_window:.0f}s into the window"
+                    (
+                        "risk-free: the window now pays more than it cost "
+                        "whichever side resolves"
+                    ) if intent.is_lock else (
+                        f"edge {intent.edge:+.3f}, fill #{intent.fill_index + 1}, "
+                        f"fee ${fill.fee_usd:.4f}, "
+                        f"{intent.seconds_into_window:.0f}s into the window"
+                    )
                 ),
             )
 

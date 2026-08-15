@@ -91,6 +91,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "hedge_enabled": True,
         "hedge_after_adverse_ticks": 1,
         "hedge_max_combined_cost": 99.0,
+        "lock_when_available": True,
+        "min_lock_profit_usd": 0.10,
         "allow_partial_fill": True,
         "max_cost_per_window_usd": 120.0,
         "max_open_windows": 8,

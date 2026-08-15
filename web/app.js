@@ -854,6 +854,12 @@ function renderStrategy(s) {
       '', `${st.open_windows} of ${cfg.max_open_windows} windows`],
     ['Fills', String(stats.fills || 0),
       '', `${byStage.open || 0} open · ${byStage.add || 0} add · ${byStage.hedge || 0} hedge`],
+    // A lock pays more than it cost whichever side resolves — the only leg
+    // that is unambiguously worth buying. 7.31% of the wallet's two-sided
+    // windows land here.
+    ['Risk-free locks', String(stats.locks || 0),
+      stats.locks ? 'pos' : '',
+      `${money(stats.locked_profit_usd || 0)} guaranteed`],
     ['Clip', money(cfg.base_clip_usd), '',
       `flat — measured $5.04 at every rung`],
     ['Ladder cap', String(cfg.max_fills_per_window), '',

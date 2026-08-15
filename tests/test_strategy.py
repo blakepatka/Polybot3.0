@@ -501,6 +501,117 @@ class HedgeTests(unittest.TestCase):
         self.assertEqual(state.fills, 4)
 
 
+class LockTests(unittest.TestCase):
+    """Risk-free locks: take them deliberately.
+
+    Re-tested 2026-08-15 after an operator challenge. The original test summed
+    the two sides' VWAPs and asked whether a matched *pair* cost under $1 —
+    valid only when the share counts match, and the wallet's legs are lopsided
+    by a median 2.11x. The correct test is the worst case: guaranteed payout is
+    min(up_shares, down_shares) against TOTAL cost. Measured that way, 7.31% of
+    its 52,816 two-sided windows are genuine locks.
+    """
+
+    def test_a_lock_is_detected_and_sized_to_the_shortfall(self):
+        s = build()
+        st = s.state_for("btc-updown-5m-1")
+        # 20 shares of Up for $6.00. The other side is available at 12c, so
+        # 20 shares of Down costs ~$2.42 all-in for a guaranteed $20.
+        st.record("up", 6.0, 20.0, NOW - 60)
+        lock = s.lock_for(st, "down", 0.12)
+        self.assertIsNotNone(lock)
+        size_usd, profit = lock
+        q = s.all_in_cost(0.12)
+        self.assertAlmostEqual(size_usd, 20.0 * q)
+        self.assertAlmostEqual(profit, 20.0 - 6.0 - 20.0 * q)
+        self.assertGreater(profit, 0)
+
+    def test_no_lock_when_the_other_side_is_too_expensive(self):
+        s = build()
+        st = s.state_for("btc-updown-5m-1")
+        st.record("up", 6.0, 10.0, NOW - 60)   # 60c a share
+        # 10 shares of Down at 55c costs more than the $10 it could pay back.
+        self.assertIsNone(s.lock_for(st, "down", 0.55))
+
+    def test_the_shortfall_is_what_matters_when_both_sides_are_held(self):
+        """The third fill of an already two-sided window can still lock."""
+        s = build()
+        st = s.state_for("btc-updown-5m-1")
+        st.record("up", 6.0, 25.0, NOW - 60)
+        st.record("down", 1.0, 5.0, NOW - 30)   # already holds 5 Down
+        lock = s.lock_for(st, "down", 0.10)
+        self.assertIsNotNone(lock)
+        size_usd, profit = lock
+        q = s.all_in_cost(0.10)
+        # Only the 20-share shortfall is bought, not another 25.
+        self.assertAlmostEqual(size_usd, 20.0 * q)
+        self.assertAlmostEqual(profit, 25.0 - 7.0 - 20.0 * q)
+
+    def test_an_already_balanced_window_offers_no_lock(self):
+        s = build()
+        st = s.state_for("btc-updown-5m-1")
+        st.record("up", 5.0, 10.0, NOW - 60)
+        st.record("down", 5.0, 10.0, NOW - 30)
+        self.assertIsNone(s.lock_for(st, "down", 0.10))
+
+    def test_a_lock_too_small_to_be_worth_it_is_skipped(self):
+        s = build(min_lock_profit_usd=2.00)
+        st = s.state_for("btc-updown-5m-1")
+        # 20 shares held for $6.00 — a 30c basis, so even a 60c hedge locks,
+        # but only for $1.66, which is under this floor.
+        st.record("up", 6.0, 20.0, NOW - 60)
+        self.assertIsNone(s.lock_for(st, "down", 0.60))
+        # The same position at 12c locks ~$11.6 and is taken.
+        self.assertIsNotNone(s.lock_for(st, "down", 0.12))
+
+    def test_an_expensive_basis_offers_no_lock_at_all(self):
+        s = build()
+        st = s.state_for("btc-updown-5m-1")
+        st.record("up", 12.0, 20.0, NOW - 60)   # 60c basis
+        self.assertIsNone(s.lock_for(st, "down", 0.45))
+
+    def test_the_screenshot_window_is_evaluated_correctly(self):
+        """BTC 1:30-1:35: Up 12.5sh $5.21, Down 37.2sh $7.52, cost $12.73.
+
+        Guaranteed payout is min(12.5, 37.2) = $12.50 against $12.73 spent, so
+        the worst case is -$0.23 — favourable, but NOT a lock. The combined
+        VWAP of $0.619 makes it look like a 38% lock only because the legs are
+        3.0x lopsided. This is the exact case the old test got wrong.
+        """
+        s = build()
+        st = s.state_for("btc-updown-5m-1")
+        st.record("up", 5.21, 12.5, NOW - 120)
+        st.record("down", 7.52, 37.2, NOW - 60)
+        guaranteed = min(st.side_shares["up"], st.side_shares["down"])
+        self.assertAlmostEqual(guaranteed, 12.5)
+        self.assertAlmostEqual(st.cost_usd, 12.73)
+        self.assertLess(guaranteed, st.cost_usd, "worst case is a small loss")
+        # Combined VWAP would have called this a lock; the correct test does not.
+        combined = st.vwap("up") + st.vwap("down")
+        self.assertLess(combined, 1.0)
+        # Down already outnumbers Up, so there is no shortfall to buy.
+        self.assertIsNone(s.lock_for(st, "down", 0.12))
+
+    def test_a_lock_bypasses_the_combined_cost_ceiling(self):
+        """A guaranteed profit needs no further justification."""
+        s = build(hedge_max_combined_cost=1.0)
+        m = market(up_ask=0.60, down_ask=0.11)
+        s.record_fill(m.slug, "up", 6.0, 20.0, "open", NOW - 60)
+        intent = s.evaluate(m, spot(drift_ratio=0.9985), NOW)
+        self.assertEqual(intent.side, "down")
+        self.assertTrue(intent.is_lock)
+        self.assertGreater(intent.lock_profit_usd, 0)
+        self.assertIsNone(intent.reason, intent.reason)
+
+    def test_locks_can_be_switched_off(self):
+        s = build(lock_when_available=False)
+        m = market(up_ask=0.60, down_ask=0.11)
+        s.record_fill(m.slug, "up", 6.0, 20.0, "open", NOW - 60)
+        intent = s.evaluate(m, spot(drift_ratio=0.9985), NOW)
+        self.assertFalse(intent.is_lock)
+        self.assertEqual(intent.lock_profit_usd, 0.0)
+
+
 class ExposureTests(unittest.TestCase):
     """Peak 8 concurrent windows; cost/window median $19.28, p90 $96.43."""
 

@@ -86,10 +86,53 @@ That is a latency edge — lifting asks the spot move has already invalidated bu
 the book has not yet repriced — worth roughly three points of probability, and
 it is **gone above 0.80**. Hence the 0.02–0.85 band.
 
-**It is not arbitrage.** Across its 52,816 two-sided windows the first fill and
-the hedge together cost a median **$1.042**, and only 35.6% of those pairs came
-in under $1.00. Buying both sides of a binary for more than $1 is not a lock; it
-is paying a premium to flatten a losing window.
+**It is not arbitrage — but 7.31% of the time it lands on one.**
+
+This was re-tested on 2026-08-15 after an operator challenge, and the first
+test was wrong. It summed the two sides' VWAPs and asked whether a matched
+*pair* cost under $1. That is only equivalent when the share counts match, and
+this wallet's legs are lopsided by a median **2.11x** — only 6.9% are within
+1.1x of balanced.
+
+The correct test is the worst case. Whichever side resolves, you are paid
+`shares` on that side and nothing on the other, so the guaranteed payout of a
+two-sided window is `min(up_shares, down_shares)` against the **total** cost:
+
+| Measured across all 52,816 two-sided windows | |
+|---|---|
+| Genuine risk-free locks | **3,863 (7.31%)** |
+| Median worst case | **−$12.71** |
+| Median guaranteed / cost | **0.623** |
+| Aggregate: $3.38M spent bought | $2.05M guaranteed (**−39.3%**) |
+| Realised P/L on two-sided windows | **−3.11%** |
+
+For contrast, the old VWAP test claimed 33.3% were locks. A worked example of
+why it disagrees — BTC 1:30–1:35, taken from the live feed: Up 12.5 shares for
+$5.21 and Down 37.2 shares for $7.52, total $12.73. Combined VWAP is $0.619,
+which *looks* like a 38% lock. But the guaranteed payout is `min(12.5, 37.2)`
+= $12.50 against $12.73 spent — a **−$0.23** worst case. Favourable, not free.
+
+So the strategy is directional and sometimes ends up two-sided; it is not an
+arbitrage strategy. But the 7.31% that *are* locks are free money, and this
+implementation now detects and takes them deliberately — see below.
+
+### Taking the locks
+
+Holding `s_other` shares of the opposite side for a total window cost `c`, and
+able to buy this side at an all-in `q` per share, buying `n` more gives a
+guaranteed `min(s_other, s_this + n)` against `c + n·q`. Below the balance
+point the profit rises with `n`; past it the payout stops growing while the
+cost does not. So the optimum is exactly the **shortfall** `s_other − s_this` —
+which is why a third fill into an already two-sided window can still create a
+lock.
+
+When one exists, the order is sized to take it and the model-quality gates are
+bypassed: a lock's profit is arithmetic on the book, so it does not depend on
+the model being right, and `max_model_edge`, the confidence floor and the price
+band all encode views about when the *model* can be trusted. Depth, timing and
+every exposure and capital cap still bind, because those govern whether the
+order can actually be filled and afforded. Set `lock_when_available: false` to
+turn this off, or raise `min_lock_profit_usd` to ignore trivial ones.
 
 **The ladder and the hedge cost capital, not P/L.** Holding the wallet's own
 entry decisions fixed and varying only the follow-through, over all 101,541
