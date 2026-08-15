@@ -209,6 +209,56 @@ class PolymarketFeed:
             await self._client.aclose()
             self._client = None
 
+    async def resolution(self, slug: str) -> str | None:
+        """The winning side the venue published for ``slug``.
+
+        ``"up"``, ``"down"``, or None when the window has not resolved yet, was
+        voided, or cannot be read. This is the authority on who won: settling
+        a spot anchor against a spot close only ever *infers* the outcome, and
+        the exchanges we read are not the Chainlink stream the venue resolves
+        on. Near a coin-flip boundary — which is most of a five-minute window —
+        that basis decides the verdict, so the inference is wrong often enough
+        to invert a strategy's measured P/L.
+
+        Returns None rather than guessing. The caller keeps the position open
+        and retries, and falls back to the spot comparison only once the window
+        is old enough that waiting is worse than approximating.
+        """
+        assert self._client is not None
+        try:
+            resp = await self._client.get(f"{GAMMA}/events", params={"slug": slug})
+            if resp.status_code != 200:
+                return None
+            events = resp.json()
+            if not events:
+                return None
+            markets = events[0].get("markets") or []
+            if not markets:
+                return None
+            market = markets[0]
+            if not market.get("closed"):
+                return None
+
+            outcomes = market.get("outcomes")
+            prices = market.get("outcomePrices")
+            if isinstance(outcomes, str):
+                outcomes = json.loads(outcomes)
+            if isinstance(prices, str):
+                prices = json.loads(prices)
+            if not outcomes or not prices or len(outcomes) != len(prices):
+                return None
+
+            # A resolved binary market pays one side in full. Anything else —
+            # an unresolved pair still marked closed, or a 50/50 void — is not
+            # an outcome we may settle against.
+            for label, price in zip(outcomes, prices):
+                if float(price) >= 0.99:
+                    side = str(label).strip().lower()
+                    return side if side in ("up", "down") else None
+            return None
+        except Exception:
+            return None
+
     async def discover(self, include_next: bool = True) -> list[MarketWindow]:
         """Fetch the in-progress window for every asset/window pair.
 

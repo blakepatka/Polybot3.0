@@ -11,28 +11,95 @@
     "autostart_mode": "paper"
   },
 
-  "assets": ["btc", "sol", "xrp", "eth"],
+  "_assets_note": "The wallet trades btc/eth/sol/xrp and nothing else — 184 of 654,200 scraped rows touch any other slug. Assets outside this set have no measured basis.",
+  "assets": ["btc", "eth", "sol", "xrp"],
   "windows": ["5m", "15m"],
-  "excluded_markets": [
-    {
-      "asset": "sol",
-      "window": "5m",
-      "reason": "Disabled by operator"
-    }
-  ],
+  "excluded_markets": [],
 
-  "_strategy_note": "'directional' is the lead/lag model with the measured entry cap - see entry.max_entries_per_window. 'maker' quotes both sides for sub-$1 pairs (structurally sound but its paper P/L so far is one lottery hit, not an edge). 'both' runs both.",
-  "strategy": "directional",
+  "_strategy_note": "1:1 behavioural replication of Polymarket wallet 0x3c58ef422754ff22c7e806336feba0064d8b776b (@antsaslyku). Every value is measured from a complete scrape of its public history: 654,200 activity rows over 113 days (2026-04-24 to 2026-08-15), 569,015 fills, 85,001 redemptions, $4,190,784 turnover, 101,541 windows reconstructed end-to-end to a known winner. See polybot/strategy.py for the derivation of each number.",
+  "strategy": {
+    "dry_run": false,
+    "risk_multiplier": 1.0,
+
+    "assets": ["btc", "eth", "sol", "xrp"],
+    "windows": ["5m", "15m"],
+
+    "_timing_note": "First fill lands p10 7s / p50 53s / p90 291s into the window; the earliest observed in 101,652 windows was 2s. Entries run the full length of the window and first-fill ROI is HIGHEST in the last decile (+16.19%), so max_entry_window_fraction is 1.0 rather than the 0.5 the old directional profile used.",
+    "min_entry_offset_seconds": 2.0,
+    "max_entry_window_fraction": 1.0,
+    "min_seconds_remaining": 5.0,
+
+    "_price_note": "The wallet buys at price p and wins at p+0.03, consistently, from 0.05 to 0.75. The edge is +0.054 at its best (0.05-0.10) and reaches zero at 0.80-0.85 (-0.002) and above (0.90+: -0.007). Replayed on its own entries with flat $5 clips, the 0.02-0.85 band returns +3.50% over 98,742 windows.",
+    "min_entry_price": 0.02,
+    "max_entry_price": 0.85,
+    "min_confidence": 0.0,
+    "min_edge": 0.0,
+    "_max_model_edge_note": "The single most important safety gate. Our probability and the book's price are two estimates of the same quantity; when they disagree by tens of points the near-certain explanation is a broken spot feed, not a 50x mispricing of a five-minute window. The wallet's largest measured edge across 101,541 windows was +0.054, so anything past 0.25 is rejected as implausible rather than traded.",
+    "max_model_edge": 0.25,
+
+    "_sizing_note": "Median fill is $5.04 — and it is $5.04 at EVERY ladder position from the 1st fill to the 26th. There is no escalation in this wallet, no Kelly and no bankroll fraction. (An earlier build of this repo modelled a $60 'escalation clip' at fill 8; that was an artefact of a 16.8h sample and is measurably false over 113 days.)",
+    "base_clip_usd": 5.0,
+
+    "_price_scaled_clip_note": "The $5 clip applies at ORDINARY prices only. Measured median fill size by price paid, across all 569,015 fills: under 2c $0.05, 2-5c $1.20, 5-10c $1.54, 10-20c $3.05, then $5.00-$5.06 from 30c up. The wallet stakes dust on longshots. Cloning it with a flat $5 clip is a ~100x over-size in exactly the band where the position usually expires worthless — observed 2026-08-15, a flat clip bought 467 shares at 1c three times and lost every one.",
+    "price_scaled_clips": true,
+    "clip_under_2c_usd": 0.05,
+    "clip_under_5c_usd": 1.20,
+    "clip_under_10c_usd": 1.55,
+    "clip_under_20c_usd": 3.05,
+
+    "_min_order_note": "The venue's orderMinSize is FIVE SHARES, not five dollars. The dollar minimum therefore moves with price: $0.05 at a cent, $3.00 at 60c, $4.25 at 85c. This is why the wallet shows $3.65 and $4.17 fills — they are ~5-10 share orders, not partial fills.",
+    "min_order_shares": 5.0,
+
+    "_ladder_note": "Mean 5.6 fills/window, median 3, p90 13, max 391. Second same-side fill lands a median 21s after the first; 56.5% of add-ons go in above the prior fill and 33.8% below. Measured ROI by cap on the first side: 1 fill +2.69%, 2 +2.72%, 3 +2.56%, 5 +2.22%, uncapped +2.02% — so 2 is the profit-maximising setting and 40 is the faithful one.",
+    "max_fills_per_window": 40,
+
+    "_window_mix_note": "86.3% of the wallet's fills are on 5m and only 13.7% on 15m ($3.76M vs $0.43M). It entered 82,677 distinct 5m windows against 18,975 15m ones — a 4.36:1 ratio — averaging 5.94 fills per 5m window against 4.11 per 15m. Three times as many 5m windows exist per hour, so equal entry rates already give ~3:1; the rest comes from entering a higher fraction of 5m windows (69% vs 47% on btc). Without these two caps, 15m positions stay open three times longer, sit on the open-exposure budget and starve the 5m windows that carry most of the wallet's activity.",
+    "max_fills_by_window": {
+      "5m": 40,
+      "15m": 28
+    },
+    "max_open_windows_15m": 3,
+    "min_seconds_between_fills": 2.0,
+    "add_on_enabled": true,
+    "add_into_strength": true,
+    "average_down_enabled": true,
+
+    "_hedge_note": "OPERATOR DECISION 2026-08-15: enabled to reproduce the wallet literally. 52.0% of its windows open a second leg, a median 66s after the first fill. The two legs together cost a median $1.042 and only 35.6% of its 52,816 hedges came in under $1.00 — so this is NOT arbitrage; buying a pair above $1.00 books a loss at the moment of the fill. Holding entries fixed, the full ladder+hedge returned +2.05% on $4.19M where the first side alone returned +2.02% on $2.73M: the hedge buys 5.9x the capital for the same return per dollar. Set hedge_enabled=false, or hedge_max_combined_cost=1.0 to admit only genuine locks.",
+    "_switching_note": "Confirmed against live activity 2026-08-15: BTC 1:25-1:30 went Up 71c -> Down 39c -> Down 39c -> Down 12c, and XRP 1:25-1:30 went Down 34c -> Up 67c -> Down 37c -> Down 51c -> Up 34c inside about a minute. It switches sides freely and repeatedly, and once it holds both sides it simply adds to whichever it currently likes. One confirming scan, not two: at a 3s poll a two-tick confirmation costs 6s per switch, which is most of the move on a 300s window.",
+    "hedge_enabled": true,
+    "hedge_after_adverse_ticks": 1,
+    "hedge_max_combined_cost": 99.0,
+
+    "_partial_fill_note": "The wallet fills at exactly 5.0 shares constantly ($1.68 at 32c, $1.78 at 34c, $2.64 at 51c) because orderMinSize is five SHARES and a limit order takes whatever is resting. The paper broker used to reject any clip the book could not fill in full, which silently skipped a large share of these trades.",
+    "allow_partial_fill": true,
+
+    "_exposure_note": "The wallet's own envelope: peak 8 concurrent windows, cost per window median $19.28 / p90 $96.43 / max $2,418.53, turning over a median $33,667 a day. These are the outer bound only — the mandatory bankroll controls below are applied afterwards and are what actually binds at a small balance.",
+    "max_cost_per_window_usd": 120.0,
+    "max_open_windows": 8,
+    "max_capital_usd": 650.0,
+
+    "_execution_note": "Every one of the 569,015 observed fills is a taker BUY and there is not a single SELL: positions are held to resolution and redeemed. usdcSize/(shares*price) averages 1.0245, consistent with this venue's shares*rate*p*(1-p) taker fee — which confirms every ROI quoted here is already fee-inclusive.",
+    "slippage_ticks": 1,
+    "min_depth_usd": 25.0
+  },
+
+  "_limits_note": "Caps applied by the engine after the strategy has decided what it wants, and which the strategy cannot raise.",
+  "limits": {
+    "hard_window_cap_usd": 25.0,
+    "hard_market_window_cap_usd": 10.0
+  },
 
   "bankroll": {
-    "_note": "Operator-declared $150 bankroll. These limits are mandatory in both Paper and Live, including override modes: keep $90 uncommitted, risk no more than $25 in one timed interval, stop after $15 net settled loss in a UTC day, and turn over no more than $300 per UTC day.",
+    "_note": "Mandatory in both Paper and Live. These are the controls that actually bind: the wallet being cloned runs a median $19.28 per window against a balance far larger than this one, so at this bankroll the clone's ladder will be truncated here rather than by max_fills_per_window.",
     "activated_at": 1785549409,
-    "starting_balance_usd": 150.0,
-    "max_open_exposure_usd": 60.0,
-    "cash_reserve_usd": 90.0,
-    "max_daily_loss_usd": 15.0,
-    "max_daily_turnover_usd": 300.0
+    "starting_balance_usd": 50.0,
+    "max_open_exposure_usd": 50.0,
+    "cash_reserve_usd": 0.0,
+    "max_daily_loss_usd": 5.0,
+    "daily_profit_lock_usd": 5000.0,
+    "max_daily_turnover_usd": 100000.0
   },
+
   "live_market_selection": {
     "_note": "Disabled by operator choice: Live may trade every asset/window that Paper may trade. Historical paper rankings remain visible for comparison only.",
     "enabled": false,
@@ -41,67 +108,21 @@
     "max_markets": 5
   },
 
-  "maker": {
-    "min_lock_cents": 2.0,
-    "base_clip_usd": 5.0,
-    "max_pairs_per_window": 40,
-    "min_price": 0.03,
-    "max_price": 0.97,
-    "min_seconds_remaining": 45,
-    "skew_strength": 0.35,
-    "improve_ticks": 0,
-    "residual_flatten": true,
-    "_rewards_note": "Liquidity rewards were investigated and RULED OUT for these markets: Gamma reports rewardsMaxSpread/rewardsMinSize, but the venue reward register (8960 markets, 18 pages) contains none of the short crypto windows. No reward income is modelled. target_rewards is retained only to size quotes larger; it earns nothing.",
-    "target_rewards": false,
-    "_drift_note": "Cancel and re-quote once mid has moved this far from our resting price. Stale quotes are the main source of adverse selection.",
-    "max_quote_drift_cents": 2.0
-  },
-
   "sizing": {
+    "_note": "Dashboard sliders. base_clip_usd on the strategy is what the clone actually stakes; these are the ceilings the sliders enforce on top of it.",
     "base_clip_usd": 5.0,
     "max_clip_usd": 5.0,
     "max_per_window_usd": 25.0,
-    "_daily_cap_note": "Paper and Live use the same $300 UTC-day turnover ceiling for the $150 bankroll. The separate mandatory bankroll controls also cap simultaneous exposure and stop on daily loss, even when profit-tuned override is active.",
-    "daily_cap_usd": 300.0,
-    "paper_daily_cap_usd": 300.0,
-    "calibration": 0.55,
+    "daily_cap_usd": 100000.0,
+    "paper_daily_cap_usd": 100000.0,
+    "calibration": 1.0,
     "profit_lock_usd": 5000.0
   },
 
-  "entry": {
-    "_profit_tuned_note": "Live 24h review: the confidence-only cohort returned 11.2% ROI. Keeping signals at or above 70% confidence, at 79c or less, and in the first half of the window replayed at 41.5% ROI while reducing worst-window loss from $69.94 to $14.96. Other bot limits remain bypassed except operator market exclusions, the confirmed opposite-side switch gate, and the mandatory $150-bankroll controls: $25 per shared timed interval, $60 total open exposure, $15 daily loss stop, and $300 daily turnover. Exchange availability, balance/allowance, minimum order, and fillability still apply.",
-    "confidence_only": false,
-    "profit_tuned": true,
-    "hard_market_window_cap_usd": 25.0,
-    "hard_window_cap_usd": 25.0,
-    "min_confidence": 0.70,
-    "min_expected_roi": 0.04,
-    "_entry_cap_note": "At most two same-window entries remain allowed. This preserves the pre-change effective cap after disabling the reserved reversal slot and prevents the failed reversal experiment from silently creating a third ordinary entry.",
-    "max_entries_per_window": 2,
-    "_evidence_gate_note": "When enabled by operator limits, every new Paper or Live entry must still belong to a Paper cohort with at least 100 settlements and positive fee-adjusted ROI in both the latest 50 and preceding 50. This prevents a stale allowlist from continuing to trade a degraded cohort.",
-    "require_evidence_qualified_market": false,
-    "_experimental_market_note": "Optional exact Paper-only forward-test cohorts may bypass the rolling evidence gate only when their configured minimum confidence meets paper_experimental_min_confidence (90% by default). They remain blocked in Live until normally evidence-qualified.",
-    "paper_experimental_min_confidence": 0.90,
-    "asset_min_confidence": {},
-    "paper_experimental_markets": [],
-    "_price_band_note": "Reviewed LIVE entries at 80-89c returned -3.9% and 90c+ returned -0.8%; profit-tuned mode therefore caps the worst execution price at 79c while leaving cheap high-confidence entries eligible.",
-    "max_entry_price": 0.79,
-    "min_entry_price": 0.30,
-    "min_seconds_remaining": 25,
-    "max_window_fraction": 0.50,
-    "_reversal_note": "Opposite-side entries remain implemented but are disabled because settled reversal windows failed the 100-window, two-block evidence gate. Re-enable only for a new controlled Paper forward test; Live reversal stays disabled until its own Paper cohort qualifies.",
-    "reversal_enabled": false,
-    "reversal_live_enabled": false,
-    "reversal_min_confidence": 0.72,
-    "reversal_min_expected_roi": 0.04,
-    "reversal_confirmation_seconds": 6.0,
-    "reversal_min_observations": 3,
-    "max_side_switches": 1
-  },
-
   "risk": {
+    "_circuit_breaker_note": "Raised from 5 to 30 on 2026-08-15. This guard exists to stop a runaway loop, not to cap a laddering strategy: the wallet being cloned averages 5.94 fills per 5m window across up to 8 concurrent windows, so 5 entries per 60s fights the strategy rather than protecting it — it tripped 24 times in a five-minute paper run. 30 still stops a genuine runaway well inside one window.",
     "circuit_breaker": {
-      "max_consecutive_large_trades": 5,
+      "max_consecutive_large_trades": 30,
       "window_seconds": 60,
       "cooldown_seconds": 300
     },
@@ -111,11 +132,12 @@
       "cooldown_seconds": 900
     },
     "depth_guard": {
-      "_comment": "Roughly 10x the base clip. The upstream repo's 250 assumed far larger sizing and would exclude most of this venue's short-window books.",
-      "min_orderbook_depth_usd": 50.0
+      "_comment": "Roughly 5x the $5 clip. The upstream repo's 250 assumed far larger sizing and would exclude most of this venue's short-window books.",
+      "min_orderbook_depth_usd": 25.0
     },
+    "_trade_floor_note": "The venue's orderMinSize is FIVE SHARES, not five dollars, so the real dollar floor moves with the price: $0.05 at a cent, $4.25 at 85c. The old $5 figure treated a share count as a dollar amount, which both blocked every legitimate cheap entry and forced a 100x over-size on longshots. The strategy computes the true per-price minimum itself (see min_stake_for); this is only the absolute backstop.",
     "trade_floor": {
-      "min_trade_size_usd": 5.0
+      "min_trade_size_usd": 0.05
     },
     "volatility_regime": {
       "halt_above_bps": 60.0,
@@ -124,7 +146,7 @@
     }
   },
 
-  "_fees_note": "Read from the live CLOB V2 market feeSchedule: fee = shares * rate * (price * (1-price)) ^ exponent, TAKERS ONLY. Makers pay nothing. At 50c and rate 0.07 this is 1.75c/share (3.5% of notional).",
+  "_fees_note": "Read from the live CLOB V2 market feeSchedule: fee = shares * rate * (price * (1-price)) ^ exponent, TAKERS ONLY. Makers pay nothing. At 50c and rate 0.07 this is 1.75c/share (3.5% of notional). Confirmed against the scraped wallet: usdcSize/(shares*price) averages 1.0245.",
   "fees": {
     "taker_rate": 0.07,
     "exponent": 1.0,

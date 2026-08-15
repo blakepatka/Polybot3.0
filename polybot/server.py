@@ -131,17 +131,40 @@ def create_app() -> FastAPI:
 
     # ---- state ---------------------------------------------------------
 
-    def build_state(pnl_range: str = "all") -> dict[str, Any]:
+    def resolve_strategy(requested: str | None) -> str | None:
+        """Normalise a strategy filter to a name the store will recognise.
+
+        Anything unknown — including the explicit "all" — becomes ``None``,
+        which every store read treats as "no filter". A stale selection left in
+        a browser tab therefore degrades to the combined view rather than
+        silently rendering an empty dashboard.
+        """
+        if not requested or requested == "all":
+            return None
+        known = {row["strategy"] for row in store.strategies_seen(engine.runtime.mode)}
+        known.update(engine.configured_strategies())
+        return requested if requested in known else None
+
+    def build_state(
+        pnl_range: str = "all", strategy: str | None = None
+    ) -> dict[str, Any]:
         mode = engine.runtime.mode
         snap = engine.snapshot()
         window = RANGE_SECONDS.get(pnl_range, None)
         since = (time.time() - window) if window else None
+        strategy = resolve_strategy(strategy)
 
+        # Every settled-performance panel is derived from the same (mode,
+        # strategy, since) triple, so the headline number, the curve and the
+        # breakdown below it can never describe different sets of trades.
         return {
             "ts": time.time(),
             "mode": mode,
+            "strategy_filter": strategy or "all",
+            "strategies_seen": store.strategies_seen(mode),
+            "strategy_selection": snap["strategy_selection"],
             "runtime": snap["runtime"],
-            "stats": snap["stats"],
+            "stats": store.stats(mode, None, strategy),
             "engine": snap["engine"],
             "risk": snap["risk"],
             "markets": snap["markets"],
@@ -150,7 +173,7 @@ def create_app() -> FastAPI:
             "bankroll": snap["bankroll"],
             "performance_targets": snap["performance_targets"],
             "strategy": snap["strategy"],
-            "maker": snap["maker"],
+            "strategies": snap.get("strategies", {}),
             "spot": engine.spot.snapshot(),
             "sources": {
                 **engine.spot.source_health,
@@ -158,12 +181,12 @@ def create_app() -> FastAPI:
                 "chainlink_streams": engine.chainlink.health,
             },
             "chainlink": engine.chainlink.snapshot(),
-            "positions": engine.open_positions_view(),
-            "equity": store.equity_curve(mode, since),
+            "positions": engine.open_positions_view(strategy),
+            "equity": store.equity_curve(mode, since, strategy=strategy),
             "pnl_range": pnl_range,
             # Scoped to the selected range so the headline figure and the curve
             # below it always describe the same set of settlements.
-            "range_stats": store.stats(mode, since),
+            "range_stats": store.stats(mode, since, strategy),
             "config": {
                 "assets": engine.assets,
                 "windows": engine.windows,
@@ -172,7 +195,8 @@ def create_app() -> FastAPI:
                 "performance_targets": config.get("performance_targets", {}),
                 "live_market_selection": config["live_market_selection"],
                 "sizing": config["sizing"],
-                "entry": config["entry"],
+                "limits": config["limits"],
+                "strategy_config": config["strategy"],
                 "risk": config["risk"],
                 "model_trust": config["model_trust"],
             },
@@ -180,11 +204,15 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/api/state")
-    async def get_state(range: str = "all") -> dict[str, Any]:
-        return build_state(range if range in RANGE_SECONDS else "all")
+    async def get_state(
+        range: str = "all", strategy: str | None = None
+    ) -> dict[str, Any]:
+        return build_state(range if range in RANGE_SECONDS else "all", strategy)
 
     @app.get("/api/stream")
-    async def stream(request: Request, range: str = "all") -> StreamingResponse:
+    async def stream(
+        request: Request, range: str = "all", strategy: str | None = None
+    ) -> StreamingResponse:
         """Server-sent events. Chosen over WebSockets because the data flows one
         way and SSE reconnects on its own when the engine restarts."""
         pnl_range = range if range in RANGE_SECONDS else "all"
@@ -194,7 +222,7 @@ def create_app() -> FastAPI:
                 if await request.is_disconnected():
                     break
                 try:
-                    payload = json.dumps(build_state(pnl_range), default=str)
+                    payload = json.dumps(build_state(pnl_range, strategy), default=str)
                     yield f"data: {payload}\n\n"
                 except Exception as exc:
                     yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
@@ -276,8 +304,10 @@ def create_app() -> FastAPI:
             ("starting_balance_usd", venue_minimum, 1000000.0),
             ("max_open_exposure_usd", venue_minimum, 1000000.0),
             ("max_daily_loss_usd", 1.0, 1000000.0),
-            # The operator explicitly requires a 62% absolute floor.
-            ("min_confidence", 0.62, 0.99),
+            # Strategy entry bounds. The floor is 0.0 rather than the old 0.62
+            # because the cloned wallet's median entry is a 0.54 coin flip and
+            # its edge comes from price, not from a confidence threshold.
+            ("min_confidence", 0.0, 0.99),
             ("max_entry_price", 0.01, 0.99),
             ("max_window_fraction", 0.05, 1.0),
         )
@@ -295,24 +325,25 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="no recognised limit fields")
 
         bankroll = config["bankroll"]
-        entry = config["entry"]
+        limits = config["limits"]
+        strategy_cfg = config["strategy"]
         runtime = engine.runtime.snapshot()
         candidate = {
             "max_per_trade_usd": runtime["max_per_trade_usd"],
             "max_per_market_window_usd": float(
-                entry.get(
+                limits.get(
                     "hard_market_window_cap_usd",
-                    entry["hard_window_cap_usd"],
+                    limits["hard_window_cap_usd"],
                 )
             ),
-            "max_per_window_usd": float(entry["hard_window_cap_usd"]),
+            "max_per_window_usd": float(limits["hard_window_cap_usd"]),
             "daily_cap_usd": float(bankroll["max_daily_turnover_usd"]),
             "starting_balance_usd": float(bankroll["starting_balance_usd"]),
             "max_open_exposure_usd": float(bankroll["max_open_exposure_usd"]),
             "max_daily_loss_usd": float(bankroll["max_daily_loss_usd"]),
-            "min_confidence": float(entry["min_confidence"]),
-            "max_entry_price": float(entry["max_entry_price"]),
-            "max_window_fraction": float(entry["max_window_fraction"]),
+            "min_confidence": float(strategy_cfg["min_confidence"]),
+            "max_entry_price": float(strategy_cfg["max_entry_price"]),
+            "max_window_fraction": float(strategy_cfg["max_entry_window_fraction"]),
         }
         candidate.update(updates)
 
@@ -369,14 +400,16 @@ def create_app() -> FastAPI:
             daily_cap_usd=runtime_updates["daily_cap_usd"],
             paper_daily_cap_usd=runtime_updates["daily_cap_usd"],
         )
-        entry.update(
+        limits.update(
             hard_market_window_cap_usd=round(
                 candidate["max_per_market_window_usd"], 2
             ),
             hard_window_cap_usd=runtime_updates["max_per_window_usd"],
+        )
+        strategy_cfg.update(
             min_confidence=round(candidate["min_confidence"], 4),
             max_entry_price=round(candidate["max_entry_price"], 4),
-            max_window_fraction=round(candidate["max_window_fraction"], 4),
+            max_entry_window_fraction=round(candidate["max_window_fraction"], 4),
         )
         bankroll.update(
             starting_balance_usd=round(candidate["starting_balance_usd"], 2),
@@ -390,11 +423,13 @@ def create_app() -> FastAPI:
             max_daily_turnover_usd=runtime_updates["daily_cap_usd"],
         )
 
-        # SignalModel caches these at construction; update the live instance
+        # The strategy caches these at construction; update the live instance
         # so the next scan uses the dashboard values without a restart.
-        engine.model.min_confidence = float(entry["min_confidence"])
-        engine.model.max_entry_price = float(entry["max_entry_price"])
-        engine.model.max_window_fraction = float(entry["max_window_fraction"])
+        engine.antsaslyku.min_confidence = float(strategy_cfg["min_confidence"])
+        engine.antsaslyku.max_entry_price = float(strategy_cfg["max_entry_price"])
+        engine.antsaslyku.max_entry_window_fraction = float(
+            strategy_cfg["max_entry_window_fraction"]
+        )
 
         save_operator_limits({
             "sizing": {
@@ -403,14 +438,18 @@ def create_app() -> FastAPI:
                 "daily_cap_usd": config["sizing"]["daily_cap_usd"],
                 "paper_daily_cap_usd": config["sizing"]["paper_daily_cap_usd"],
             },
-            "entry": {
-                "hard_market_window_cap_usd": entry[
+            "limits": {
+                "hard_market_window_cap_usd": limits[
                     "hard_market_window_cap_usd"
                 ],
-                "hard_window_cap_usd": entry["hard_window_cap_usd"],
-                "min_confidence": entry["min_confidence"],
-                "max_entry_price": entry["max_entry_price"],
-                "max_window_fraction": entry["max_window_fraction"],
+                "hard_window_cap_usd": limits["hard_window_cap_usd"],
+            },
+            "strategy": {
+                "min_confidence": strategy_cfg["min_confidence"],
+                "max_entry_price": strategy_cfg["max_entry_price"],
+                "max_entry_window_fraction": strategy_cfg[
+                    "max_entry_window_fraction"
+                ],
             },
             "bankroll": {
                 "starting_balance_usd": bankroll["starting_balance_usd"],
@@ -422,15 +461,67 @@ def create_app() -> FastAPI:
         })
         return {"ok": True, "persisted": True, **candidate}
 
-    @app.post("/api/risk/paper-daily-loss-bypass")
-    async def bypass_paper_daily_loss() -> dict[str, Any]:
-        """Bypass today's loss stop in Paper only; never changes Live limits."""
-        if engine.runtime.mode != "paper":
+    @app.post("/api/risk/daily-loss-bypass")
+    async def bypass_daily_loss(body: dict = Body(default={})) -> dict[str, Any]:
+        """Bypass the daily loss stop in Paper or Live, for an hour or a day."""
+        scope = str(body.get("scope") or "hour").lower()
+        if scope not in {"hour", "day"}:
             raise HTTPException(
-                status_code=400,
-                detail="The temporary daily-loss bypass is available only in Paper mode.",
+                status_code=400, detail="scope must be 'hour' or 'day'"
             )
-        return engine.bypass_paper_daily_loss_today()
+        return engine.bypass_daily_loss_stop(scope=scope)
+
+    @app.post("/api/strategies/{name}")
+    async def set_strategy_module(
+        name: str, body: dict = Body(default={})
+    ) -> dict[str, Any]:
+        """Tune the running strategy at runtime.
+
+        This is how the ladder and the hedge are switched between the literal
+        clone and the measured-profitable subset without a restart — see the
+        `_hedge_note` and `_ladder_note` blocks in config.json for what each
+        setting is worth. ``dry_run: true`` keeps the strategy scoring and
+        logging while never reaching a broker, which is how a parameter change
+        should be forward-tested before it is allowed near real money.
+        """
+        module = getattr(engine, name.replace("-", "_"), None)
+        if module is None or not hasattr(module, "NAME") or module.NAME != name:
+            raise HTTPException(status_code=404, detail=f"no strategy module '{name}'")
+
+        if "dry_run" in body:
+            module.dry_run = bool(body["dry_run"])
+        if "risk_multiplier" in body:
+            try:
+                multiplier = float(body["risk_multiplier"])
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="risk_multiplier must be a number")
+            if not 0.0 < multiplier <= 5.0:
+                raise HTTPException(
+                    status_code=400, detail="risk_multiplier must be in (0, 5]"
+                )
+            module.risk_multiplier = multiplier
+        for key in ("hedge_enabled", "add_on_enabled"):
+            if key in body:
+                setattr(module, key, bool(body[key]))
+        for key in (
+            "max_capital_usd", "max_fills_per_window", "max_open_windows",
+            "max_cost_per_window_usd", "hedge_max_combined_cost",
+            "min_entry_price", "max_entry_price", "base_clip_usd",
+        ):
+            if key in body:
+                setattr(module, key, type(getattr(module, key))(body[key]))
+
+        # In-memory only. A restart returns the strategy to its config.json
+        # defaults, so nothing set here can silently outlive the session.
+        store.log(
+            engine.runtime.mode,
+            "strategy",
+            f"{name}: dry_run={module.dry_run} "
+            f"risk_multiplier={module.risk_multiplier} "
+            f"max_fills={module.max_fills_per_window} "
+            f"hedge={module.hedge_enabled}",
+        )
+        return {"ok": True, "persisted": False, **module.snapshot()}
 
     @app.post("/api/reset")
     async def reset(body: dict = Body(default={})) -> dict[str, Any]:
@@ -444,45 +535,91 @@ def create_app() -> FastAPI:
                 status_code=400,
                 detail="Refusing to wipe live history without confirm='DELETE LIVE HISTORY'.",
             )
-        store.reset(mode)
-        engine.stats.signal_scans = 0
-        engine.stats.entries = 0
-        engine.stats.rejections.clear()
-        return {"ok": True, "mode": mode}
+        # Optional: restart one paper cohort without discarding the other
+        # strategy's comparison history.
+        strategy = resolve_strategy(body.get("strategy"))
+        store.reset(mode, strategy)
+        if strategy is None:
+            engine.stats.signal_scans = 0
+            engine.stats.entries = 0
+            engine.stats.rejections.clear()
+            # The strategy holds its own in-memory ladder bookkeeping, which
+            # backs max_capital_usd and max_open_windows. Wiping the ledger
+            # without clearing it leaves the dashboard reporting capital at
+            # work against an empty ledger, and leaves those budgets consumed
+            # by windows that no longer exist.
+            engine.antsaslyku.windows_state.clear()
+            engine.antsaslyku.stats.update(
+                scans=0, intents=0, fills=0, cost_usd=0.0
+            )
+            engine.antsaslyku.stats["rejections"] = {}
+            engine.antsaslyku.stats["by_stage"] = {}
+        return {"ok": True, "mode": mode, "strategy": strategy or "all"}
 
     # ---- data -----------------------------------------------------------
 
+    @app.get("/api/strategies")
+    async def list_strategies() -> dict[str, Any]:
+        """What the selector should offer, and what is trading right now."""
+        return {
+            **engine.strategy_status(),
+            "seen": store.strategies_seen(engine.runtime.mode),
+        }
+
+    @app.post("/api/strategy")
+    async def select_strategy(body: dict = Body(default={})) -> dict[str, Any]:
+        """Choose the single strategy Live is allowed to trade.
+
+        Paper ignores the selection for execution purposes — it runs every
+        configured strategy so the curves are comparable — but the dashboard
+        uses the same name as its display filter.
+        """
+        name = str(body.get("strategy") or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="strategy is required")
+        result = engine.select_strategy(name)
+        if not result.get("ok"):
+            raise HTTPException(status_code=400, detail=result.get("error"))
+        return {**result, **engine.strategy_status()}
+
     @app.get("/api/positions")
-    async def positions() -> dict[str, Any]:
-        return {"positions": engine.open_positions_view()}
+    async def positions(strategy: str | None = None) -> dict[str, Any]:
+        return {"positions": engine.open_positions_view(resolve_strategy(strategy))}
 
     @app.get("/api/activity")
     async def activity(limit: int = 200) -> dict[str, Any]:
         return {"activity": store.activity(engine.runtime.mode, min(max(limit, 1), 1000))}
 
     @app.get("/api/settlements")
-    async def settlements(limit: int = 200, range: str = "all") -> dict[str, Any]:
+    async def settlements(
+        limit: int = 200, range: str = "all", strategy: str | None = None
+    ) -> dict[str, Any]:
         range_name = range if range in RANGE_SECONDS else "all"
         window = RANGE_SECONDS[range_name]
         since = (time.time() - window) if window else None
+        picked = resolve_strategy(strategy)
         return {
             "settlements": store.settlements(
                 engine.runtime.mode,
                 min(max(limit, 1), 1000),
                 since,
+                picked,
             ),
-            "summary": store.win_loss_summary(engine.runtime.mode, since),
+            "summary": store.win_loss_summary(engine.runtime.mode, since, picked),
             "range": range_name,
+            "strategy": picked or "all",
         }
 
     @app.get("/api/by-asset")
-    async def by_asset(range: str = "all") -> dict[str, Any]:
+    async def by_asset(range: str = "all", strategy: str | None = None) -> dict[str, Any]:
         range_name = range if range in RANGE_SECONDS else "all"
         window = RANGE_SECONDS[range_name]
         since = (time.time() - window) if window else None
+        picked = resolve_strategy(strategy)
         return {
-            "rows": store.by_asset(engine.runtime.mode, since),
+            "rows": store.by_asset(engine.runtime.mode, since, picked),
             "range": range_name,
+            "strategy": picked or "all",
         }
 
     @app.get("/api/signals")
@@ -491,10 +628,17 @@ def create_app() -> FastAPI:
         return {"signals": list(engine.latest_signals.values())}
 
     @app.get("/api/equity")
-    async def equity(range: str = "all") -> dict[str, Any]:
+    async def equity(range: str = "all", strategy: str | None = None) -> dict[str, Any]:
         window = RANGE_SECONDS.get(range if range in RANGE_SECONDS else "all")
         since = (time.time() - window) if window else None
-        return {"equity": store.equity_curve(engine.runtime.mode, since), "range": range}
+        picked = resolve_strategy(strategy)
+        return {
+            "equity": store.equity_curve(
+                engine.runtime.mode, since, strategy=picked
+            ),
+            "range": range,
+            "strategy": picked or "all",
+        }
 
     # ---- vault ----------------------------------------------------------
 

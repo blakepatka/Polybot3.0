@@ -43,15 +43,38 @@ RESAMPLE_STEP = 20.0
 BUFFER_SECONDS = 1200.0
 
 
+# The two price series this buffer can hold, and the reason they must never be
+# read as one. EXCHANGE is Coinbase/Kraken: the *predictor*, which leads by a
+# second or two. RESOLUTION is the Chainlink stream the venue actually settles
+# on. They track each other but are not equal — the gap between them is a real,
+# drifting basis worth several dollars on BTC.
+#
+# Any calculation that subtracts one price from another — drift, anchor-vs-spot,
+# anchor-vs-close — must take both ends from the SAME series, or it measures the
+# basis instead of the market. A window anchored on one series and settled on
+# the other books that basis as profit or loss that never existed.
+EXCHANGE = "exchange"
+RESOLUTION = "chainlink"
+
+
 @dataclass(slots=True)
 class Tick:
     ts: float
     price: float
+    # Which series this price came from. Untagged ticks are exchange prices,
+    # so that a caller predating the split keeps its old meaning.
+    source: str = EXCHANGE
 
 
 @dataclass
 class AssetState:
-    """Rolling price history and derived statistics for one asset."""
+    """Rolling price history and derived statistics for one asset.
+
+    Holds more than one price series. Read them with the ``source`` argument
+    on :meth:`price_at_or_before`, :meth:`latest_from` and :meth:`resample`,
+    and keep both ends of any comparison on the same one — see the note on
+    :data:`EXCHANGE` above.
+    """
 
     asset: str
     ticks: deque[Tick] = field(default_factory=lambda: deque(maxlen=4096))
@@ -59,12 +82,20 @@ class AssetState:
     last_update: float = 0.0
     sources: set[str] = field(default_factory=set)
     backfilled: bool = False
+    # Most recent (ts, price) per series. Kept alongside the buffer so the hot
+    # path never scans backwards to find the newest tick of one source.
+    latest_by_source: dict[str, tuple[float, float]] = field(default_factory=dict)
 
-    def push(self, price: float, ts: float | None = None) -> None:
+    def push(
+        self, price: float, ts: float | None = None, source: str = EXCHANGE
+    ) -> None:
         if price is None or price <= 0 or not math.isfinite(price):
             return
         ts = time.time() if ts is None else ts
-        tick = Tick(ts, price)
+        tick = Tick(ts, price, source)
+        previous = self.latest_by_source.get(source)
+        if previous is None or ts >= previous[0]:
+            self.latest_by_source[source] = (ts, price)
         if self.ticks and ts < self.ticks[-1].ts:
             # Multiple venues do not always report in arrival order. Keep the
             # buffer chronological because anchors, resampling and change
@@ -91,27 +122,61 @@ class AssetState:
             return
         for ts, price in points:
             if price and price > 0 and math.isfinite(price):
-                self.ticks.append(Tick(ts, price))
+                self.ticks.append(Tick(ts, price, EXCHANGE))
         ordered = sorted(self.ticks, key=lambda t: t.ts)
         cutoff = time.time() - BUFFER_SECONDS
         self.ticks.clear()
         self.ticks.extend(t for t in ordered if t.ts >= cutoff)
         self.backfilled = True
 
-    def price_at_or_before(self, ts: float) -> float | None:
-        """Most recent price at/just before ``ts``.
+    def price_at_or_before(
+        self, ts: float, source: str | None = None
+    ) -> float | None:
+        """Most recent price at/just before ``ts``, from one series.
 
-        Used to anchor a window's opening price. Returns None when the buffer
+        Used to anchor a window's opening price. Returns None when that series
         does not reach back that far — the caller must not guess, since a wrong
-        anchor flips the sign of every signal in that window.
+        anchor flips the sign of every signal in that window, and must not
+        silently substitute the other series, since that books the basis
+        between them as a price move.
         """
         best: float | None = None
         for tick in self.ticks:
-            if tick.ts <= ts:
-                best = tick.price
-            else:
+            if tick.ts > ts:
                 break
+            if source is None or tick.source == source:
+                best = tick.price
         return best
+
+    def latest_from(self, source: str) -> tuple[float, float] | None:
+        """Newest ``(ts, price)`` from one series, or None if it has none."""
+        return self.latest_by_source.get(source)
+
+    def has_source(self, source: str) -> bool:
+        return source in self.latest_by_source
+
+    def pricing_source(self, anchor_ts: float, now: float, max_age: float) -> str | None:
+        """Pick the one series to measure a window's drift on.
+
+        Exchange spot is preferred because it *leads* the resolution stream,
+        and that lead is the entire edge. Chainlink is the fallback rather
+        than the default: it is what the venue settles on, so it is never
+        wrong, merely later.
+
+        The choice is deliberately all-or-nothing. A series qualifies only if
+        it covers both ends — the window's open and a fresh reading now — so
+        that drift is a difference within one series. Returning None (and
+        trading nothing) is correct when neither does; splicing the two is how
+        an inter-feed basis becomes a phantom signal.
+        """
+        for candidate in (EXCHANGE, RESOLUTION):
+            newest = self.latest_by_source.get(candidate)
+            if newest is None or now - newest[0] > max_age:
+                continue
+            if self.price_at_or_before(anchor_ts, candidate) is None:
+                continue
+            return candidate
+        return None
 
     def change_bps(self, lookback_seconds: float) -> float | None:
         """Return over ``lookback_seconds``, in basis points."""
@@ -127,7 +192,12 @@ class AssetState:
             return None
         return (self.last_price / base - 1.0) * 10_000.0
 
-    def resample(self, lookback_seconds: float, step: float = RESAMPLE_STEP) -> list[float]:
+    def resample(
+        self,
+        lookback_seconds: float,
+        step: float = RESAMPLE_STEP,
+        source: str | None = None,
+    ) -> list[float]:
         """Prices on a uniform time grid, most recent last.
 
         Volatility must never be measured off raw ticks. Polls land at
@@ -136,10 +206,17 @@ class AssetState:
         Both effects inflate a naive estimate by an order of magnitude, which
         would make every real signal look like noise. Sampling on a fixed grid
         removes both.
+
+        Pass ``source`` for the same reason drift needs it: two series
+        interleaved in one buffer alternate around their basis, and that
+        sawtooth is indistinguishable from volatility to this estimator.
         """
         now = time.time()
         start = now - lookback_seconds
-        usable = [t for t in self.ticks if t.ts >= start]
+        usable = [
+            t for t in self.ticks
+            if t.ts >= start and (source is None or t.source == source)
+        ]
         if len(usable) < 3:
             return []
 
@@ -156,14 +233,21 @@ class AssetState:
             grid += step
         return out
 
+    @property
+    def primary_source(self) -> str:
+        """The series to describe this asset with when no window is in view."""
+        return EXCHANGE if self.has_source(EXCHANGE) else RESOLUTION
+
     def realized_vol_bps(self, lookback_seconds: float = 900.0) -> float | None:
         """Realized volatility over the lookback, in bps.
 
         Standard deviation of grid-sampled log returns scaled to the full
         lookback. This gates the trading regime: above the configured ceiling
-        the lead/lag edge stops being reliable.
+        the lead/lag edge stops being reliable — so it is measured on a single
+        series, or the inter-feed sawtooth reads as a volatility spike and
+        halts trading on a market that never moved.
         """
-        prices = self.resample(lookback_seconds)
+        prices = self.resample(lookback_seconds, source=self.primary_source)
         if len(prices) < 6:
             return None
         rets = [

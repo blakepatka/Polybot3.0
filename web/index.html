@@ -45,6 +45,13 @@
 
   <div class="ctl-divider"></div>
 
+  <div class="ctl-group">
+    <div class="ctl-label">Strategy <span id="strategy-hint" class="ctl-hint"></span></div>
+    <div class="seg" id="strategy-seg"></div>
+  </div>
+
+  <div class="ctl-divider"></div>
+
 
   <div class="ctl-group grow">
     <div class="slider-row">
@@ -198,49 +205,47 @@
 
   <div class="price-row" id="price-row"></div>
 
-  <div class="card" id="maker-card">
+  <div class="card" id="strategy-card">
     <div class="card-head">
       <div>
-        <div class="card-label">Two-sided book — locked pairs</div>
-        <div class="card-h2">Market making</div>
-        <div class="card-note">A share of Up and a share of Down together always pay exactly $1.
-          Acquired for less than that, the difference is locked profit with <b>no directional risk</b>.
-          Measured on live books: unreachable by crossing the spread (0 of 532 samples), available at
-          the bid every time. <b>Residual</b> is unpaired inventory — the only real exposure here, and
-          the engine re-quotes to flatten it.</div>
+        <div class="card-label">Wallet replication — live ladder state</div>
+        <div class="card-h2">@antsaslyku</div>
+        <div class="card-note">A 1:1 behavioural clone of Polymarket wallet
+          <b>0x3c58…776b</b>, rebuilt from a complete scrape of its public history:
+          <b>654,200 activity rows over 113 days</b>, 569,015 fills, $4.19M turnover,
+          101,541 windows reconstructed to a known winner. It buys at price <i>p</i> and wins
+          at about <i>p</i>+0.03 — a latency edge, <b>not arbitrage</b>: its two-sided windows
+          cost a median $1.042 for a pair that pays $1.00. Flat $5 clips, held to resolution,
+          never sold.</div>
       </div>
-      <span class="pill" id="maker-pill">—</span>
+      <span class="pill" id="strategy-pill">—</span>
     </div>
 
-    <div class="metricrow" id="maker-metrics"></div>
+    <div class="metricrow" id="strategy-metrics"></div>
 
-    <div class="subtabs mt" id="maker-subtabs">
-      <button class="subtab active" data-mk="inventory">Inventory <span class="count" id="cnt-inv">0</span></button>
-      <button class="subtab" data-mk="quotes">Resting quotes <span class="count" id="cnt-q">0</span></button>
+    <div class="subtabs mt" id="strategy-subtabs">
+      <button class="subtab active" data-st="ladders">Open ladders <span class="count" id="cnt-lad">0</span></button>
+      <button class="subtab" data-st="rejections">Why it declined <span class="count" id="cnt-rej">0</span></button>
     </div>
 
-    <div id="mk-inventory">
+    <div id="st-ladders">
       <table class="tbl">
         <thead><tr>
-          <th>Market</th><th class="r">Up</th><th class="r">Down</th>
-          <th class="r">Pair cost</th><th style="width:170px">Locked</th>
-          <th class="r">Locked P/L</th><th>Residual</th><th class="r">Left</th>
+          <th>Market</th><th class="r">Fills</th><th class="r">Cost</th>
+          <th>First side</th><th class="r">Sides held</th><th class="r">Adverse ticks</th>
         </tr></thead>
-        <tbody id="tb-maker"><tr class="empty"><td colspan="8">No maker inventory yet.</td></tr></tbody>
+        <tbody id="tb-ladders"><tr class="empty"><td colspan="6">No open ladders.</td></tr></tbody>
       </table>
     </div>
 
-    <div id="mk-quotes" class="hidden">
+    <div id="st-rejections" class="hidden">
       <table class="tbl">
-        <thead><tr>
-          <th>Market</th><th>Side</th><th class="r">Bid</th><th class="r">Size</th>
-          <th class="r">Shares</th><th class="r">Resting</th>
-        </tr></thead>
-        <tbody id="tb-quotes"><tr class="empty"><td colspan="6">No resting quotes.</td></tr></tbody>
+        <thead><tr><th>Gate</th><th class="r">Times hit</th></tr></thead>
+        <tbody id="tb-rejections"><tr class="empty"><td colspan="2">Nothing declined yet.</td></tr></tbody>
       </table>
     </div>
 
-    <div class="card-note mt" id="maker-note"></div>
+    <div class="card-note mt" id="strategy-note"></div>
   </div>
 
 </section>
@@ -374,7 +379,7 @@
     <div class="card">
       <div class="card-head">
         <div><div class="card-label">Runtime trading control</div>
-        <div class="card-h2">Pause, resume, panic</div></div>
+        <div class="card-h2">Pause, resume, panic, bypass</div></div>
         <span class="pill" id="trading-pill">TRADING</span>
       </div>
       <div class="btn-row">
@@ -383,6 +388,12 @@
       </div>
       <div class="card-note">Panic sells all <b id="panic-count">0</b> open positions into the resting
         bids at whatever they fetch, then pauses. Positions with no bid to hit stay open and settle normally.</div>
+
+      <div class="btn-row mt">
+        <button id="btn-loss-bypass" class="btn btn-wide btn-danger">Bypass daily loss stop (1h)</button>
+        <button id="btn-loss-bypass-day" class="btn btn-wide btn-danger">Bypass for the day</button>
+      </div>
+      <div class="card-note" id="loss-bypass-note">—</div>
 
       <div class="regime" id="regime-box">
         <div class="card-label">Market regime</div>
@@ -776,6 +787,6 @@
 <script src="/static/iridescence.js"></script>
 <script src="/static/dot-field.js"></script>
 <script src="/static/border-glow.js?v=3"></script>
-<script src="/static/app.js?v=market-window-cap-1"></script>
+<script src="/static/app.js?v=antsaslyku-replication-2"></script>
 </body>
 </html>

@@ -191,6 +191,31 @@ code {
 .seg-btn.active { background: #39331f; color: var(--fg); }
 .seg-btn.live-armed.active { background: #301720; color: var(--red); }
 
+/* Strategy selector. In Paper the segment filters what the dashboard shows
+ * while every strategy keeps trading; in Live it is the switch that decides
+ * which single strategy is allowed to trade at all. The dot marks a strategy
+ * that is currently taking entries, so the two meanings stay distinguishable
+ * at a glance. */
+.ctl-hint {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: .08em;
+  color: var(--fg-dimmer);
+  opacity: .75;
+}
+#strategy-seg { flex-wrap: wrap; max-width: 460px; }
+#strategy-seg .seg-btn { padding: 6px 13px; display: inline-flex; align-items: center; gap: 6px; }
+#strategy-seg .seg-btn .live-dot {
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--green); flex: none;
+}
+#strategy-seg .seg-btn.is-idle .live-dot { background: var(--fg-dimmer); opacity: .5; }
+#strategy-seg .seg-btn .n {
+  font-family: var(--mono); font-size: 10px; color: var(--fg-dimmer);
+}
+#strategy-seg .seg-btn.active .n { color: var(--fg-dim); }
+#strategy-seg .seg-btn.exclusive.active { background: #1d3326; color: var(--fg); }
+
 /* ── sliders ──────────────────────────────────────────────────────────── */
 .slider-row { display: flex; justify-content: space-between; align-items: baseline; }
 .slider-val { font-family: var(--mono); font-size: 13px; color: var(--fg); }

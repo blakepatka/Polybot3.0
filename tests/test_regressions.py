@@ -11,7 +11,12 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import httpx
 
 from polybot import settings as settings_module
-from polybot.engine import Engine, EngineStats, SIGNAL_RETENTION_SECONDS
+from polybot.engine import (
+    Engine,
+    EngineStats,
+    SIGNAL_RETENTION_SECONDS,
+    UNRESOLVED_ABANDON_SECONDS,
+)
 from polybot.broker.live import (
     LiveBroker,
     _allowance_values,
@@ -27,8 +32,8 @@ from polybot.feeds.spot import AssetState, SpotFeed
 from polybot.fees import taker_fee
 from polybot.risk import RiskManager
 from polybot.settings import Runtime, live_trading_enabled
-from polybot.signal import Signal, SignalModel
 from polybot.store import Store
+from polybot.strategy import AntsaslykuStrategy
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -69,29 +74,54 @@ class SpotFeedSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(feed.source_health["kraken"]["active"])
         self.assertEqual(feed.source_health["kraken"]["received"], 0)
 
-    def test_signal_model_rejects_stale_spot_quote(self):
+    def test_strategy_rejects_stale_spot_quote(self):
         config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
-        model = SignalModel(config)
+        strategy = AntsaslykuStrategy(config)
         state = AssetState("btc", last_price=100.0, last_update=1.0)
-
-        self.assertIsNone(
-            model.evaluate(SimpleNamespace(start=0.0), state, now=20.0)
+        market = SimpleNamespace(
+            start=0.0, asset="btc", window="5m", slug="btc-updown-5m-0"
         )
+
+        self.assertIsNone(strategy.evaluate(market, state, now=20.0))
 
 
 class ConfiguredMarketUniverseTests(unittest.TestCase):
-    def test_only_requested_assets_are_enabled(self):
+    def test_shipped_config_matches_the_measured_wallet(self):
+        """config.json must stay pinned to what the scrape actually showed.
+
+        These are not preferences. Each one is a number measured from 654,200
+        activity rows, and a silent drift here is a silent change of strategy.
+        """
         config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
-        self.assertEqual(config["assets"], ["btc", "sol", "xrp", "eth"])
-        self.assertEqual(
-            [(row["asset"], row["window"]) for row in config["excluded_markets"]],
-            [("sol", "5m")],
-        )
-        self.assertEqual(config["bankroll"]["starting_balance_usd"], 150.0)
-        self.assertEqual(config["bankroll"]["max_open_exposure_usd"], 60.0)
-        self.assertEqual(config["entry"]["hard_window_cap_usd"], 25.0)
-        self.assertFalse(config["entry"]["reversal_enabled"])
-        self.assertEqual(config["entry"]["max_entries_per_window"], 2)
+        # The wallet trades these four and nothing else.
+        self.assertEqual(config["assets"], ["btc", "eth", "sol", "xrp"])
+        self.assertEqual(config["windows"], ["5m", "15m"])
+        self.assertEqual(config["excluded_markets"], [])
+
+        strategy = config["strategy"]
+        # Median fill is $5.04 at every ladder index — there is no escalation.
+        self.assertEqual(strategy["base_clip_usd"], 5.0)
+        # Edge is positive to ~0.80 and gone by 0.85.
+        self.assertEqual(strategy["min_entry_price"], 0.02)
+        self.assertEqual(strategy["max_entry_price"], 0.85)
+        # Largest measured edge in 101,541 windows was +0.054.
+        self.assertEqual(strategy["max_model_edge"], 0.25)
+        # Entries run the full window; first-fill ROI peaks in the last decile.
+        self.assertEqual(strategy["max_entry_window_fraction"], 1.0)
+        # Earliest observed first fill was 2s in.
+        self.assertEqual(strategy["min_entry_offset_seconds"], 2.0)
+        # Peak concurrency observed was 8.
+        self.assertEqual(strategy["max_open_windows"], 8)
+        self.assertEqual(config["limits"]["hard_window_cap_usd"], 25.0)
+
+    def test_the_literal_clone_settings_are_the_shipped_default(self):
+        """Operator decision 2026-08-15: reproduce the wallet, hedge included."""
+        strategy = json.loads(
+            (ROOT / "config.json").read_text(encoding="utf-8")
+        )["strategy"]
+        self.assertTrue(strategy["hedge_enabled"])
+        self.assertEqual(strategy["max_fills_per_window"], 40)
+        self.assertEqual(strategy["hedge_max_combined_cost"], 99.0)
 
 
 class DashboardLimitPersistenceTests(unittest.TestCase):
@@ -102,14 +132,14 @@ class DashboardLimitPersistenceTests(unittest.TestCase):
             operator_path = root / "operator_limits.json"
             config_path.write_text(
                 json.dumps({
-                    "entry": {"min_confidence": 0.70},
+                    "strategy": {"min_confidence": 0.70},
                     "bankroll": {"max_open_exposure_usd": 60.0},
                 }),
                 encoding="utf-8",
             )
             operator_path.write_text(
                 json.dumps({
-                    "entry": {"min_confidence": 0.75},
+                    "strategy": {"min_confidence": 0.75},
                     "bankroll": {"max_open_exposure_usd": 80.0},
                 }),
                 encoding="utf-8",
@@ -120,7 +150,7 @@ class DashboardLimitPersistenceTests(unittest.TestCase):
             ):
                 config = settings_module.load_config()
 
-        self.assertEqual(config["entry"]["min_confidence"], 0.75)
+        self.assertEqual(config["strategy"]["min_confidence"], 0.75)
         self.assertEqual(config["bankroll"]["max_open_exposure_usd"], 80.0)
 
     def test_paper_and_live_daily_caps_are_identical(self):
@@ -137,305 +167,67 @@ class OperatorMarketExclusionTests(unittest.IsolatedAsyncioTestCase):
         self.engine = object.__new__(Engine)
         self.engine.config = self.config
 
-    def test_only_sol_five_minute_is_disabled(self):
+    def test_shipped_config_disables_nothing(self):
+        """All eight markets the wallet trades start enabled.
+
+        The previous exclusion list was measured against the deleted
+        directional strategy's losing cohorts and says nothing about this one.
+        """
+        for asset in ("btc", "eth", "sol", "xrp"):
+            for window in ("5m", "15m"):
+                with self.subTest(market=f"{asset} {window}"):
+                    self.assertTrue(
+                        self.engine.configured_market_allowed(asset, window)
+                    )
+
+    def test_an_operator_exclusion_blocks_the_market(self):
+        self.config["excluded_markets"] = [
+            {"asset": "sol", "window": "5m", "reason": "test"}
+        ]
         self.assertFalse(self.engine.configured_market_allowed("sol", "5m"))
-        self.assertTrue(self.engine.configured_market_allowed("sol", "15m"))
-        self.assertTrue(self.engine.configured_market_allowed("btc", "5m"))
-        self.assertTrue(self.engine.configured_market_allowed("eth", "5m"))
-        self.assertTrue(self.engine.configured_market_allowed("xrp", "5m"))
-
-    def test_rolling_evidence_gate_blocks_a_degraded_static_allowlist(self):
-        self.config["entry"]["require_evidence_qualified_market"] = True
-        self.engine.store = SimpleNamespace(
-            cohort_evidence=MagicMock(
-                return_value={"evidence_qualified": False}
-            )
-        )
-
-        self.assertFalse(self.engine.configured_market_allowed("btc", "5m"))
         self.assertEqual(
-            self.engine.configured_market_rejection("btc", "5m"),
-            "market failed rolling paper evidence gate",
+            self.engine.configured_market_rejection("sol", "5m"),
+            "market disabled by operator",
         )
+        self.assertTrue(self.engine.configured_market_allowed("sol", "15m"))
 
-    def test_rolling_evidence_gate_allows_a_qualified_cohort(self):
-        self.config["entry"]["require_evidence_qualified_market"] = True
-        self.engine.store = SimpleNamespace(
-            cohort_evidence=MagicMock(
-                return_value={"evidence_qualified": True}
-            )
-        )
-
-        self.assertTrue(self.engine.configured_market_allowed("btc", "5m"))
-
-    def test_90_percent_experiment_bypasses_evidence_only_in_paper(self):
-        self.config["entry"].update(
-            require_evidence_qualified_market=True,
-            asset_min_confidence={"btc": 0.90},
-            paper_experimental_markets=[
-                {"asset": "btc", "window": "5m", "min_confidence": 0.90}
-            ],
-        )
-        self.engine.store = SimpleNamespace(
-            cohort_evidence=MagicMock(
-                return_value={"evidence_qualified": False}
-            )
-        )
-        self.engine.runtime = SimpleNamespace(mode="paper")
-
-        self.assertTrue(self.engine.configured_market_allowed("btc", "5m"))
-        self.engine.runtime.mode = "live"
-        self.assertFalse(self.engine.configured_market_allowed("btc", "5m"))
-
-    def test_configured_76_percent_experiment_bypasses_only_in_paper(self):
-        self.config["entry"].update(
-            require_evidence_qualified_market=True,
-            paper_experimental_min_confidence=0.76,
-            asset_min_confidence={"btc": 0.76},
-            paper_experimental_markets=[
-                {"asset": "btc", "window": "5m", "min_confidence": 0.76}
-            ],
-        )
-        self.engine.store = SimpleNamespace(
-            cohort_evidence=MagicMock(
-                return_value={"evidence_qualified": False}
-            )
-        )
-        self.engine.runtime = SimpleNamespace(mode="paper")
-
-        self.assertTrue(self.engine.configured_market_allowed("btc", "5m"))
-        self.engine.runtime.mode = "live"
-        self.assertFalse(self.engine.configured_market_allowed("btc", "5m"))
-
-    def test_static_exclusion_still_wins_over_paper_experiment(self):
-        self.config["entry"].update(
-            require_evidence_qualified_market=True,
-            asset_min_confidence={"sol": 0.90},
-            paper_experimental_markets=[
-                {"asset": "sol", "window": "5m", "min_confidence": 0.90}
-            ],
-        )
-        self.engine.runtime = SimpleNamespace(mode="paper")
-
-        self.assertFalse(self.engine.configured_market_allowed("sol", "5m"))
-
-    async def test_profit_override_cannot_score_or_trade_disabled_market(self):
-        self.config["entry"]["profit_tuned"] = True
+    async def test_a_disabled_market_is_never_scored_or_traded(self):
+        """The exclusion must short-circuit before any feed or model work."""
+        self.config["excluded_markets"] = [
+            {"asset": "sol", "window": "5m", "reason": "test"}
+        ]
         for mode in ("paper", "live"):
             with self.subTest(mode=mode):
                 engine = object.__new__(Engine)
                 engine.config = self.config
                 engine.runtime = SimpleNamespace(mode=mode, snapshot=lambda: {})
-                engine.store = SimpleNamespace(
-                    exposure_since=MagicMock(return_value=0.0),
-                    stats=MagicMock(return_value={"total_pnl": 0.0}),
-                )
-                engine.live_market_selection = MagicMock(return_value={})
                 engine.stats = EngineStats()
+                engine.live_market_allowed = MagicMock(return_value=True)
                 engine.spot = SimpleNamespace(
                     get=MagicMock(side_effect=AssertionError("spot data consulted"))
                 )
-                engine.model = SimpleNamespace(
-                    evaluate=MagicMock(side_effect=AssertionError("model consulted"))
+                engine.antsaslyku = SimpleNamespace(
+                    NAME="antsaslyku",
+                    prune=MagicMock(),
+                    evaluate=MagicMock(
+                        side_effect=AssertionError("strategy consulted")
+                    ),
                 )
                 market = SimpleNamespace(
                     asset="sol", window="5m", slug="sol-5m", end=300.0
                 )
 
-                await engine._scan([market], 100.0)
+                await engine._run_strategy([market], 100.0)
 
-                self.assertEqual(
-                    engine.stats.rejections.get("market disabled by operator"), 1
-                )
                 engine.spot.get.assert_not_called()
-                engine.model.evaluate.assert_not_called()
-
-
-class ConfidenceOnlyOverrideTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        self.config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
-        self.config["entry"].update(
-            confidence_only=True,
-            profit_tuned=False,
-            min_confidence=0.62,
-            max_entry_price=0.80,
-        )
-
-    def _signal(self, confidence, entry_price=0.80):
-        return Signal(
-            asset="btc",
-            slug="btc-5m",
-            window="5m",
-            side="up",
-            confidence=confidence,
-            raw_probability=confidence,
-            entry_price=entry_price,
-            expected_roi=-0.99,
-            edge=-0.50,
-            anchor_price=100.0,
-            spot_price=101.0,
-            drift_bps=100.0,
-            sigma_remaining=0.01,
-            seconds_remaining=1.0,
-            ask_depth_usd=0.01,
-        )
-
-    def test_confidence_override_still_obeys_hard_price_ceiling(self):
-        model = SignalModel(self.config)
-        market = SimpleNamespace(
-            start=0.0,
-            end=300.0,
-            accepting_orders=True,
-            closed=False,
-            seconds_elapsed=lambda now: 299.0,
-        )
-
-        self.assertIsNone(model._reject_reason(self._signal(0.62), market, 299.0))
-        self.assertEqual(
-            model._reject_reason(self._signal(0.90, 0.81), market, 299.0),
-            "entry 0.81 above price ceiling",
-        )
-        self.assertEqual(
-            model._reject_reason(self._signal(0.619), market, 299.0),
-            "confidence 62% < 62%",
-        )
-
-        market.accepting_orders = False
-        self.assertEqual(
-            model._reject_reason(self._signal(0.90), market, 299.0),
-            "market not accepting orders",
-        )
-
-    def test_asset_specific_confidence_floor_is_enforced(self):
-        self.config["entry"]["asset_min_confidence"] = {"btc": 0.76}
-        model = SignalModel(self.config)
-        market = SimpleNamespace(
-            start=0.0,
-            end=300.0,
-            accepting_orders=True,
-            closed=False,
-            seconds_elapsed=lambda now: 1.0,
-        )
-
-        self.assertEqual(
-            model._reject_reason(self._signal(0.759), market, 1.0),
-            "confidence 76% < 76%",
-        )
-        self.assertIsNone(model._reject_reason(self._signal(0.76), market, 1.0))
-
-    async def _exercise_scan(
-        self, mode, confidence=0.62, open_exposure=0.0, expect_entry=True
-    ):
-        engine = object.__new__(Engine)
-        engine.config = self.config
-        engine.runtime = SimpleNamespace(
-            mode=mode,
-            snapshot=lambda: {
-                "max_per_trade_usd": 5.0,
-                "max_per_window_usd": 0.0,
-                "daily_cap_usd": 0.0,
-            },
-            update=MagicMock(),
-        )
-        engine.store = SimpleNamespace(
-            exposure_since=MagicMock(return_value=0.0),
-            open_exposure=MagicMock(return_value=open_exposure),
-            stats=MagicMock(return_value={"total_pnl": 0.0}),
-            window_exposure=MagicMock(return_value=0.0),
-            entries_for_window=MagicMock(side_effect=AssertionError("entry cap consulted")),
-            open_position_for=MagicMock(return_value=None),
-            interval_exposure=MagicMock(return_value=0.0),
-            open_position=MagicMock(return_value=1),
-            log=MagicMock(),
-        )
-        engine.live_market_selection = MagicMock(return_value={"enabled": True})
-        engine.live_market_allowed = MagicMock(return_value=False)
-        engine.spot = SimpleNamespace(get=lambda asset: object())
-        signal = SimpleNamespace(
-            tradeable=True,
-            reason=None,
-            side="up",
-            confidence=confidence,
-            entry_price=0.80,
-            ask_depth_usd=0.0,
-            anchor_price=100.0,
-            expected_roi=-0.99,
-            seconds_remaining=1.0,
-        )
-        engine.model = SimpleNamespace(evaluate=MagicMock(return_value=signal))
-        engine._remember_signal = MagicMock()
-        engine._anchors = {}
-        engine.risk = SimpleNamespace(
-            size_for=MagicMock(return_value=5.0),
-            check_entry=MagicMock(side_effect=AssertionError("risk gate consulted")),
-            record_entry=MagicMock(),
-            breaker_active=True,
-            min_trade_usd=5.0,
-        )
-        engine.stats = EngineStats()
-        fill = SimpleNamespace(
-            avg_price=0.80,
-            shares=5.0 / 0.80,
-            stake_usd=5.0,
-            ts=100.0,
-            fee_usd=0.0,
-        )
-        engine._execute_buy = AsyncMock(return_value=fill)
-        market = SimpleNamespace(
-            asset="btc",
-            slug="btc-5m",
-            window="5m",
-            end=300.0,
-            question="BTC Up or Down?",
-        )
-
-        await engine._scan([market], 100.0)
-
-        self.assertEqual(engine.stats.entries, 1 if expect_entry else 0)
-        if expect_entry:
-            engine._execute_buy.assert_awaited_once_with(market, "up", 5.0, 0.80)
-        else:
-            engine._execute_buy.assert_not_awaited()
-            self.assertTrue(
-                any(
-                    reason.startswith("$150 bankroll open-exposure cap reached")
-                    for reason in engine.stats.rejections
-                )
-            )
-        engine.live_market_allowed.assert_not_called()
-        engine.store.open_position_for.assert_not_called()
-        engine.risk.check_entry.assert_not_called()
-        engine.risk.record_entry.assert_not_called()
-
-    async def test_paper_and_live_share_the_same_override_path(self):
-        for mode in ("paper", "live"):
-            with self.subTest(mode=mode):
-                await self._exercise_scan(mode)
-
-    async def test_profit_tuned_mode_uses_the_same_paper_and_live_engine_path(self):
-        self.config["entry"].update(
-            confidence_only=False,
-            profit_tuned=True,
-            min_confidence=0.70,
-        )
-        for mode in ("paper", "live"):
-            with self.subTest(mode=mode):
-                await self._exercise_scan(mode, confidence=0.70)
-
-    async def test_profit_override_cannot_bypass_bankroll_cap(self):
-        self.config["entry"].update(confidence_only=False, profit_tuned=True)
-        for mode in ("paper", "live"):
-            with self.subTest(mode=mode):
-                await self._exercise_scan(
-                    mode, confidence=0.70, open_exposure=60.0, expect_entry=False
-                )
+                engine.antsaslyku.evaluate.assert_not_called()
 
 
 class HardWindowCapTests(unittest.TestCase):
     def setUp(self):
         self.engine = object.__new__(Engine)
         self.engine.config = {
-            "entry": {"hard_window_cap_usd": 50.0},
+            "limits": {"hard_window_cap_usd": 50.0},
         }
         self.engine.risk = SimpleNamespace(min_trade_usd=5.0)
         self.engine.store = SimpleNamespace(interval_exposure=MagicMock())
@@ -500,7 +292,7 @@ class MarketWindowCapTests(unittest.TestCase):
     def setUp(self):
         self.engine = object.__new__(Engine)
         self.engine.config = {
-            "entry": {
+            "limits": {
                 "hard_market_window_cap_usd": 20.0,
                 "hard_window_cap_usd": 50.0,
             },
@@ -574,7 +366,7 @@ class BankrollCapTests(unittest.TestCase):
         self.assertEqual(size, 7.0)
         self.assertIsNone(reason)
 
-    def test_daily_loss_stop_is_mandatory(self):
+    def test_daily_loss_stop_blocks_live_without_an_active_bypass(self):
         self.engine.store.stats.return_value = {"total_pnl": -15.0}
 
         size, reason = self.engine._apply_bankroll_cap("live", 5.0, 100.0)
@@ -591,9 +383,9 @@ class BankrollCapTests(unittest.TestCase):
         self.assertIsNone(size)
         self.assertIn("Daily profit lock", reason)
 
-    def test_temporary_daily_loss_bypass_applies_only_to_paper(self):
+    def test_temporary_daily_loss_bypass_applies_to_live_as_well_as_paper(self):
         self.engine.store.stats.return_value = {"total_pnl": -15.0}
-        self.engine.paper_daily_loss_bypass_until = 200.0
+        self.engine.daily_loss_bypass_until = 200.0
 
         paper_size, paper_reason = self.engine._apply_bankroll_cap(
             "paper", 5.0, 100.0
@@ -604,17 +396,58 @@ class BankrollCapTests(unittest.TestCase):
 
         self.assertEqual(paper_size, 5.0)
         self.assertIsNone(paper_reason)
-        self.assertIsNone(live_size)
-        self.assertIn("daily loss stop", live_reason)
+        self.assertEqual(live_size, 5.0)
+        self.assertIsNone(live_reason)
 
     def test_temporary_daily_loss_bypass_expires(self):
         self.engine.store.stats.return_value = {"total_pnl": -15.0}
-        self.engine.paper_daily_loss_bypass_until = 200.0
+        self.engine.daily_loss_bypass_until = 200.0
 
         size, reason = self.engine._apply_bankroll_cap("paper", 5.0, 200.0)
 
         self.assertIsNone(size)
         self.assertIn("daily loss stop", reason)
+
+    def test_daily_loss_bypass_lasts_one_hour_not_the_rest_of_the_day(self):
+        self.engine.runtime = SimpleNamespace(mode="live")
+        self.engine.store.log = MagicMock()
+        # Well past the UTC boundary: a day-long bypass would run to 86400, so
+        # late in the day is what distinguishes the two scopes.
+        now = 80000.0
+
+        result = self.engine.bypass_daily_loss_stop(now)
+
+        self.assertEqual(result["daily_loss_bypass_until"], now + 3600.0)
+        self.assertEqual(result["daily_loss_bypass_scope"], "hour")
+        self.assertEqual(result["mode"], "live")
+        self.assertTrue(self.engine._daily_loss_bypass_active(now + 3599.0))
+        self.assertFalse(self.engine._daily_loss_bypass_active(now + 3600.0))
+
+    def test_day_scoped_bypass_runs_to_the_utc_reset(self):
+        self.engine.runtime = SimpleNamespace(mode="live")
+        self.engine.store.log = MagicMock()
+        now = 80000.0
+
+        result = self.engine.bypass_daily_loss_stop(now, scope="day")
+
+        self.assertEqual(result["daily_loss_bypass_until"], 86400.0)
+        self.assertEqual(result["daily_loss_bypass_scope"], "day")
+        # Still holding an hour later, where the hour-scoped bypass would have
+        # already lapsed, and gone exactly at the boundary.
+        self.assertTrue(self.engine._daily_loss_bypass_active(now + 3600.0))
+        self.assertTrue(self.engine._daily_loss_bypass_active(86399.0))
+        self.assertFalse(self.engine._daily_loss_bypass_active(86400.0))
+
+    def test_daily_loss_bypass_rejects_an_unknown_scope(self):
+        self.engine.runtime = SimpleNamespace(mode="live")
+        self.engine.store.log = MagicMock()
+        self.engine.daily_loss_bypass_until = 0.0
+
+        with self.assertRaises(ValueError):
+            self.engine.bypass_daily_loss_stop(100.0, scope="forever")
+
+        self.assertEqual(self.engine.daily_loss_bypass_until, 0.0)
+        self.engine.store.log.assert_not_called()
 
     def test_daily_turnover_is_limited_to_twice_bankroll(self):
         self.engine.store.exposure_since.return_value = 296.0
@@ -711,57 +544,6 @@ class LiveWalletRiskTests(unittest.TestCase):
         self.assertIn("position API unavailable", reason)
 
 
-class ProfitTunedSignalTests(unittest.TestCase):
-    def setUp(self):
-        self.config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
-        self.model = SignalModel(self.config)
-        self.market = SimpleNamespace(
-            start=0.0,
-            end=300.0,
-            accepting_orders=True,
-            closed=False,
-            seconds_elapsed=lambda now: now,
-        )
-
-    def _signal(self, confidence=0.70, price=0.79):
-        return Signal(
-            asset="btc",
-            slug="btc-5m",
-            window="5m",
-            side="up",
-            confidence=confidence,
-            raw_probability=confidence,
-            entry_price=price,
-            expected_roi=-0.50,
-            edge=-0.50,
-            anchor_price=100.0,
-            spot_price=101.0,
-            drift_bps=100.0,
-            sigma_remaining=0.01,
-            seconds_remaining=1.0,
-            ask_depth_usd=0.01,
-        )
-
-    def test_tuned_boundary_is_accepted_despite_legacy_roi_depth_and_time_gates(self):
-        self.assertIsNone(
-            self.model._reject_reason(self._signal(), self.market, 150.0)
-        )
-
-    def test_tuned_mode_blocks_each_empirical_loss_boundary(self):
-        self.assertEqual(
-            self.model._reject_reason(self._signal(confidence=0.699), self.market, 100.0),
-            "confidence 70% < 70%",
-        )
-        self.assertEqual(
-            self.model._reject_reason(self._signal(price=0.80), self.market, 100.0),
-            "entry 0.80 above price ceiling",
-        )
-        self.assertEqual(
-            self.model._reject_reason(self._signal(), self.market, 151.0),
-            "too deep into the window (>50% elapsed)",
-        )
-
-
 class LiveTradingGateTests(unittest.TestCase):
     def test_project_env_overrides_stale_parent_environment(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -838,7 +620,13 @@ class LiveTradingGateTests(unittest.TestCase):
         self.assertNotIn("live", literals)
         self.assertEqual([c.args[0].value for c in started], ["paper"])
 
-    def test_saved_slider_below_venue_minimum_is_clamped(self):
+    def test_a_saved_sub_five_dollar_slider_is_now_honoured(self):
+        """The venue floor is five SHARES, not five dollars.
+
+        A $3 clip is a perfectly placeable order — it is ~5 shares at 60c, and
+        the cloned wallet's own activity is full of $3.65 and $4.17 fills. The
+        old $5 floor silently raised every such setting back to $5.
+        """
         config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
         with patch(
             "polybot.settings.load_runtime_limits",
@@ -852,8 +640,25 @@ class LiveTradingGateTests(unittest.TestCase):
         ):
             runtime = Runtime.from_config(config)
 
-        self.assertEqual(runtime.max_per_trade_usd, 5.0)
-        self.assertEqual(runtime.max_per_window_usd, 5.0)
+        self.assertEqual(runtime.max_per_trade_usd, 3.0)
+        self.assertEqual(runtime.max_per_window_usd, 4.0)
+
+    def test_a_slider_below_the_absolute_floor_is_still_clamped(self):
+        config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+        floor = float(config["risk"]["trade_floor"]["min_trade_size_usd"])
+        with patch(
+            "polybot.settings.load_runtime_limits",
+            return_value={
+                "paper": {
+                    "max_per_trade_usd": 0.001,
+                    "max_per_window_usd": 0.001,
+                    "daily_cap_usd": 100.0,
+                }
+            },
+        ):
+            runtime = Runtime.from_config(config)
+
+        self.assertEqual(runtime.max_per_trade_usd, floor)
 
     def test_divergent_legacy_mode_limits_fall_back_to_shared_config(self):
         config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
@@ -1123,7 +928,7 @@ class WinLossRangeTests(unittest.TestCase):
 class LiveExecutionParityTests(unittest.IsolatedAsyncioTestCase):
     async def test_hard_price_ceiling_blocks_before_book_refresh(self):
         engine = object.__new__(Engine)
-        engine.config = {"entry": {"max_entry_price": 0.80}}
+        engine.config = {"strategy": {"max_entry_price": 0.80}}
         engine.runtime = SimpleNamespace(mode="live", paused=False)
         engine.poly = SimpleNamespace(refresh_book=AsyncMock(return_value=True))
         engine.paper = SimpleNamespace(plan_buy=MagicMock(return_value=object()))
@@ -1229,39 +1034,66 @@ class LiveExecutionParityTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SettlementRecoveryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_inactive_paper_position_without_feed_is_released(self):
+    """A position with no usable feed is held for the venue, then abandoned.
+
+    Abandoning writes no settlement row, so the stake disappears from the
+    ledger rather than being booked as a loss — the strategy looks like it
+    never placed the trade. That is a worse failure than holding exposure, so
+    the wait now runs to UNRESOLVED_ABANDON_SECONDS to give the venue, which
+    needs no price at all, its chance to resolve the window.
+    """
+
+    def _store(self, tmp):
+        store = Store(Path(tmp) / "settlement.db")
+        store.open_position(
+            mode="paper",
+            slug="retired-updown-5m-0",
+            asset="retired",
+            window="5m",
+            side="up",
+            confidence=0.7,
+            entry_price=0.5,
+            shares=10.0,
+            stake_usd=5.0,
+            anchor_price=100.0,
+            opened_at=1.0,
+            window_end=300.0,
+            switches=0,
+        )
+        return store
+
+    def _engine(self, store):
+        engine = object.__new__(Engine)
+        engine.runtime = SimpleNamespace(mode="live")
+        engine.store = store
+        engine.spot = SimpleNamespace(get=MagicMock(return_value=None))
+        engine._anchors = {}
+        return engine
+
+    async def test_it_is_held_while_the_venue_might_still_resolve(self):
         with tempfile.TemporaryDirectory() as tmp:
-            store = Store(Path(tmp) / "settlement.db")
-            store.open_position(
-                mode="paper",
-                slug="retired-updown-5m-0",
-                asset="retired",
-                window="5m",
-                side="up",
-                confidence=0.7,
-                entry_price=0.5,
-                shares=10.0,
-                stake_usd=5.0,
-                anchor_price=100.0,
-                opened_at=1.0,
-                window_end=300.0,
-                switches=0,
-            )
-            engine = object.__new__(Engine)
-            engine.runtime = SimpleNamespace(mode="live")
-            engine.store = store
-            engine.spot = SimpleNamespace(get=MagicMock(return_value=None))
-            engine._anchors = {}
+            store = self._store(tmp)
+            try:
+                await self._engine(store)._settle_closed(601.0)
+                self.assertEqual(len(store.open_positions("paper")), 1)
+            finally:
+                store.close()
 
-            await engine._settle_closed(601.0)
-
-            self.assertEqual(store.open_positions("paper"), [])
-            self.assertEqual(store.stats("paper")["open_positions"], 0)
-            self.assertIn(
-                "no settlement feed",
-                store.activity("paper", 1)[0]["message"],
-            )
-            store.close()
+    async def test_it_is_released_once_the_venue_has_clearly_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            try:
+                await self._engine(store)._settle_closed(
+                    300.0 + UNRESOLVED_ABANDON_SECONDS + 1
+                )
+                self.assertEqual(store.open_positions("paper"), [])
+                self.assertEqual(store.stats("paper")["open_positions"], 0)
+                message = store.activity("paper", 1)[0]["message"]
+                self.assertIn("no settlement feed", message)
+                # The operator must be told a real stake left the ledger.
+                self.assertIn("$5.00", message)
+            finally:
+                store.close()
 
 
 class CohortEvidenceTests(unittest.TestCase):
@@ -1369,183 +1201,14 @@ class LiveMarketSelectionTests(unittest.TestCase):
         self.assertTrue(self.engine.live_market_allowed("eth", "5m", selection))
         self.assertTrue(self.engine.live_market_allowed("sol", "15m", selection))
 
-    def test_one_normal_entry_slot_is_reserved_for_side_switching(self):
-        self.engine.config["entry"] = {
-            "reversal_enabled": True,
-            "max_side_switches": 1,
-        }
-        self.engine.max_entries_per_window = 3
-
-        self.assertEqual(self.engine.normal_entry_cap(), 2)
-        self.engine.config["entry"]["reversal_enabled"] = False
-        self.assertEqual(self.engine.normal_entry_cap(), 3)
-
-
-class ConfirmedSideSwitchTests(unittest.IsolatedAsyncioTestCase):
-    def _engine(self, mode="paper"):
-        config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
-        config["entry"].update(
-            reversal_enabled=True,
-            reversal_live_enabled=False,
-            reversal_min_confidence=0.72,
-            reversal_min_expected_roi=0.04,
-            reversal_confirmation_seconds=0.0,
-            reversal_min_observations=1,
-            max_side_switches=1,
-        )
-        engine = object.__new__(Engine)
-        engine.config = config
-        engine.runtime = SimpleNamespace(
-            mode=mode,
-            snapshot=lambda: {
-                "max_per_trade_usd": 5.0,
-                "max_per_window_usd": 25.0,
-                "daily_cap_usd": 300.0,
-            },
-        )
-        engine.stats = EngineStats()
-        engine._anchors = {}
-        engine._reversal_candidates = {}
-        engine.risk = SimpleNamespace(
-            min_trade_usd=5.0,
-            size_for=MagicMock(return_value=5.0),
-            check_entry=MagicMock(
-                return_value=SimpleNamespace(allowed=True, size_usd=5.0)
-            ),
-            record_entry=MagicMock(),
-        )
-        engine.store = SimpleNamespace(
-            window_exposure=MagicMock(return_value=5.0),
-            interval_exposure=MagicMock(return_value=5.0),
-            exposure_since=MagicMock(return_value=5.0),
-            stats=MagicMock(return_value={"total_pnl": 0.0}),
-            open_position=MagicMock(return_value=2),
-            log=MagicMock(),
-        )
-        engine._apply_market_window_cap = MagicMock(return_value=(5.0, None))
-        engine._apply_hard_window_cap = MagicMock(return_value=(5.0, None))
-        engine._apply_bankroll_cap = MagicMock(return_value=(5.0, None))
-        engine._execute_buy = AsyncMock(
-            return_value=SimpleNamespace(
-                avg_price=0.31,
-                shares=15.8,
-                stake_usd=5.0,
-                fee_usd=0.1,
-                ts=100.0,
-            )
-        )
-        return engine
-
-    @staticmethod
-    def _market():
-        return SimpleNamespace(
-            asset="btc",
-            slug="btc-updown-5m-0",
-            window="5m",
-            end=300.0,
-            question="Bitcoin Up or Down?",
-        )
-
-    @staticmethod
-    def _signal(expected_roi=0.10):
-        return SimpleNamespace(
-            side="down",
-            confidence=0.80,
-            expected_roi=expected_roi,
-            entry_price=0.32,
-            ask_depth_usd=100.0,
-            anchor_price=100.0,
-        )
-
-    def test_requires_three_observations_spanning_six_seconds(self):
-        engine = self._engine()
-        engine.config["entry"].update(
-            reversal_confirmation_seconds=6.0,
-            reversal_min_observations=3,
-        )
-
-        self.assertFalse(engine._reversal_confirmed("btc-5m", "down", 100.0))
-        self.assertFalse(engine._reversal_confirmed("btc-5m", "down", 103.0))
-        self.assertTrue(engine._reversal_confirmed("btc-5m", "down", 106.0))
-
-    def test_direction_change_restarts_confirmation(self):
-        engine = self._engine()
-        engine.config["entry"].update(
-            reversal_confirmation_seconds=6.0,
-            reversal_min_observations=3,
-        )
-        engine._reversal_confirmed("btc-5m", "down", 100.0)
-        engine._reversal_confirmed("btc-5m", "down", 103.0)
-
-        self.assertFalse(engine._reversal_confirmed("btc-5m", "up", 106.0))
-        self.assertFalse(engine._reversal_confirmed("btc-5m", "up", 109.0))
-        self.assertTrue(engine._reversal_confirmed("btc-5m", "up", 112.0))
-
-    async def test_switch_uses_normal_clip_instead_of_equal_share_hedge(self):
-        engine = self._engine()
-        position = {"id": 1, "side": "up", "shares": 100.0}
-
-        await engine._maybe_reverse(
-            self._market(), self._signal(), position, side_switches=0, now=100.0
-        )
-
-        engine.risk.size_for.assert_called_once_with(0.80, 5.0)
-        engine._execute_buy.assert_awaited_once_with(
-            self._market(), "down", 5.0, 0.32
-        )
-        opened = engine.store.open_position.call_args.kwargs
-        self.assertEqual(opened["stake_usd"], 5.0)
-        self.assertEqual(opened["switches"], 1)
-
-    async def test_live_switch_stays_disabled_without_paper_evidence(self):
-        engine = self._engine(mode="live")
-
-        await engine._maybe_reverse(
-            self._market(), self._signal(), {"side": "up"}, 0, 100.0
-        )
-
-        engine._execute_buy.assert_not_awaited()
-        self.assertEqual(
-            engine.stats.rejections.get("reversal awaiting Paper evidence for Live"),
-            1,
-        )
-
-    async def test_switch_requires_positive_fee_adjusted_edge(self):
-        engine = self._engine()
-
-        await engine._maybe_reverse(
-            self._market(), self._signal(expected_roi=0.039), {"side": "up"}, 0, 100.0
-        )
-
-        engine._execute_buy.assert_not_awaited()
-        self.assertEqual(
-            engine.stats.rejections.get("reversal expected ROI below threshold"), 1
-        )
-
-    def test_window_switch_count_does_not_reset_on_later_entry(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store = Store(Path(tmp) / "switches.db")
-            common = {
-                "mode": "paper",
-                "slug": "btc-5m",
-                "asset": "btc",
-                "window": "5m",
-                "side": "up",
-                "confidence": 0.8,
-                "entry_price": 0.5,
-                "shares": 10.0,
-                "stake_usd": 5.0,
-                "anchor_price": 100.0,
-                "opened_at": 1.0,
-                "window_end": 300.0,
-            }
-            store.open_position(**common, switches=1)
-            store.open_position(**{**common, "opened_at": 2.0, "switches": 0})
-
-            self.assertEqual(
-                store.side_switches_for_window("paper", "btc-5m"), 1
-            )
-            store.close()
+    def test_only_the_replication_is_selectable(self):
+        """One strategy, so selection is a label rather than a switch."""
+        self.engine.antsaslyku = SimpleNamespace(NAME="antsaslyku")
+        self.assertEqual(self.engine.configured_strategies(), ["antsaslyku"])
+        self.assertEqual(self.engine.selected_strategy, "antsaslyku")
+        self.assertTrue(self.engine.strategy_active("antsaslyku"))
+        self.assertFalse(self.engine.strategy_active("directional"))
+        self.assertFalse(self.engine.select_strategy("maker")["ok"])
 
 
 class SignalRetentionTests(unittest.TestCase):
