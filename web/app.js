@@ -20,6 +20,14 @@ const el = (tag, cls, txt) => {
 const state = {
   snap: null,
   range: 'all',
+  // Which strategy the dashboard is describing. 'all' blends every strategy;
+  // any other value scopes the entire dashboard — headline P/L, curve, wins &
+  // losses, by-asset and open positions — to that strategy alone.
+  strategy: 'all',
+  // Last mode we rendered. Switching Paper/Live re-scopes every pane rather
+  // than letting the independently-polled ones lag a few seconds behind the
+  // SSE-driven ones and briefly show two modes' numbers side by side.
+  lastMode: null,
   tab: 'overview',
   sub: 'positions',
   assetFilter: '',
@@ -169,14 +177,29 @@ async function refreshLiveBalance(force = false) {
 
 /* ── SSE ────────────────────────────────────────────────────────────────── */
 
+/** Query suffix shared by the stream and every independently polled pane, so
+ *  no two panes can ever describe different scopes. */
+function scopeQuery() {
+  return `strategy=${encodeURIComponent(state.strategy)}`;
+}
+
 function connect() {
   if (state.es) state.es.close();
-  const es = new EventSource(`/api/stream?range=${state.range}`);
+  const es = new EventSource(`/api/stream?range=${state.range}&${scopeQuery()}`);
   state.es = es;
 
   es.onmessage = (ev) => {
     try {
       state.snap = JSON.parse(ev.data);
+      // The engine's mode can change from another tab, or from the mode
+      // control here. Either way the independently polled panes are still
+      // showing the previous mode until they are told otherwise.
+      if (state.lastMode !== null && state.snap.runtime.mode !== state.lastMode) {
+        state.lastMode = state.snap.runtime.mode;
+        refreshScopedPanes();
+      } else {
+        state.lastMode = state.snap.runtime.mode;
+      }
       render(state.snap);
       void refreshLiveBalance();
       $('foot-conn').textContent = '● live';
@@ -191,14 +214,38 @@ function connect() {
   };
 }
 
+/** Re-fetch every pane that polls independently of the SSE snapshot.
+ *
+ *  Called whenever the scope changes — execution mode or strategy — so the
+ *  whole dashboard flips together instead of the P/L card updating instantly
+ *  while the tables below it keep last scope's numbers until the next tick.
+ */
+function refreshScopedPanes() {
+  state.liveBalance = null;
+  state.balanceFetchedAt = 0;
+  state.hoverIndex = null;
+  refreshActivity();
+  if (state.tab === 'monitor') refreshSignals();
+  if (state.tab === 'winloss') refreshWinLoss();
+}
+
+/** Change what the dashboard is describing, then repoint every source at it. */
+function rescope(patch) {
+  Object.assign(state, patch);
+  connect();            // the stream carries the scope in its query string
+  refreshScopedPanes();
+  if (state.snap) render(state.snap);
+}
+
 /* ── render ─────────────────────────────────────────────────────────────── */
 
 function render(s) {
   renderControlBar(s);
+  renderStrategySelector(s);
   renderPnl(s);
   renderProfile(s);
   renderInfoCards(s);
-  renderMaker(s);
+  renderStrategy(s);
   renderPrices(s);
   renderPositions(s);
   renderMonitor(s);
@@ -241,7 +288,7 @@ function renderControlBar(s) {
 
   if (!state.limitsEditing) {
     const bank = s.bankroll || s.config.bankroll;
-    const entry = s.config.entry;
+    const entry = { ...s.config.limits, ...s.config.strategy_config };
     $('lim-bankroll').value = bank.starting_balance_usd;
     $('lim-trade').value = rt.max_per_trade_usd;
     $('lim-market-window').value = entry.hard_market_window_cap_usd ?? entry.hard_window_cap_usd;
@@ -252,8 +299,73 @@ function renderControlBar(s) {
     $('lim-daily').value = bank.max_daily_turnover_usd;
     $('lim-confidence').value = Math.round(entry.min_confidence * 100);
     $('lim-price').value = Math.round(entry.max_entry_price * 100);
-    $('lim-timing').value = Math.round(entry.max_window_fraction * 100);
+    $('lim-timing').value = Math.round(entry.max_entry_window_fraction * 100);
   }
+}
+
+const STRATEGY_LABEL = {
+  all: 'All', antsaslyku: '@antsaslyku',
+};
+const strategyLabel = (name) =>
+  STRATEGY_LABEL[name] || (name.charAt(0).toUpperCase() + name.slice(1));
+
+/** The strategy segment.
+ *
+ *  It means two different things and must say so. In Paper every configured
+ *  strategy trades at once, so the segment is a *filter* over which one the
+ *  dashboard describes. In Live only one strategy may trade, so choosing here
+ *  is a *switch* that changes what the engine does with real money — and it
+ *  therefore asks first.
+ */
+function renderStrategySelector(s) {
+  const sel = s.strategy_selection || {};
+  const exclusive = !!sel.exclusive;
+  const active = new Set(sel.active || []);
+  const seen = new Map((s.strategies_seen || []).map((r) => [r.strategy, r]));
+
+  // Offer everything configured to run plus anything with history, so a
+  // strategy that has been switched off can still be reviewed.
+  const names = [...new Set([...(sel.configured || []), ...seen.keys()])].sort();
+
+  const seg = $('strategy-seg');
+  const wanted = ['all', ...names].join('|');
+  if (seg.dataset.built !== wanted || seg.dataset.exclusive !== String(exclusive)) {
+    seg.dataset.built = wanted;
+    seg.dataset.exclusive = String(exclusive);
+    seg.replaceChildren();
+    for (const name of ['all', ...names]) {
+      const b = el('button', 'seg-btn');
+      b.dataset.strategy = name;
+      if (name !== 'all') {
+        const dot = el('span', 'live-dot');
+        b.appendChild(dot);
+      }
+      b.appendChild(el('span', '', strategyLabel(name)));
+      const row = seen.get(name);
+      if (name !== 'all' && row) {
+        b.appendChild(el('span', 'n', String(row.settlements)));
+      }
+      seg.appendChild(b);
+    }
+  }
+
+  seg.querySelectorAll('.seg-btn').forEach((b) => {
+    const name = b.dataset.strategy;
+    b.classList.toggle('active', name === state.strategy);
+    b.classList.toggle('exclusive', exclusive && name !== 'all');
+    b.classList.toggle('is-idle', name !== 'all' && !active.has(name));
+    const row = seen.get(name);
+    const n = b.querySelector('.n');
+    if (n && row) n.textContent = String(row.settlements);
+    b.title = name === 'all'
+      ? 'Combined P/L across every strategy'
+      : `${strategyLabel(name)} — ${active.has(name) ? 'trading now' : 'not trading'}` +
+        (row ? ` · ${row.settlements} settled, ${row.open_positions} open` : '');
+  });
+
+  $('strategy-hint').textContent = exclusive
+    ? '· live: one at a time'
+    : '· paper: all trading, filter view';
 }
 
 const RANGE_LABEL = {
@@ -565,14 +677,14 @@ function renderProfile(s) {
   const st = s.stats, cfg = s.config, eng = s.engine, rt = s.runtime;
   const bankroll = s.bankroll || cfg.bankroll || {};
   const target = s.performance_targets || {};
-  const dailyLossBlocked = !bankroll.paper_daily_loss_bypass_active &&
+  const dailyLossBlocked = !bankroll.daily_loss_bypass_active &&
     Number(bankroll.daily_pnl_usd || 0) <= -Math.abs(Number(bankroll.max_daily_loss_usd || 0));
 
   $('profile-title').textContent =
     `Profile reconstruction (${rt.mode === 'paper' ? 'paper only' : 'LIVE'})`;
   $('profile-sub').textContent =
     `${cfg.assets.map((a) => a.toUpperCase()).join(' / ')} candidates · ` +
-    `${cfg.entry.reversal_enabled ? 'bounded side switches enabled' : 'no side switches'} · ${rt.mode}`;
+    `${cfg.strategy_config.hedge_enabled ? 'hedging on (wallet-faithful)' : 'first side only'} · ${rt.mode}`;
 
   const pill = $('profile-pill');
   const modeLabel = String(rt.mode || 'paper').toUpperCase();
@@ -590,10 +702,10 @@ function renderProfile(s) {
     ['Signal scans',  eng.signal_scans.toLocaleString(), ''],
     ['Record',        `${st.wins}–${st.losses}`, ''],
     ['Cash reserve',  money(bankroll.cash_reserve_usd), ''],
-    ['Daily loss stop', bankroll.paper_daily_loss_bypass_active
-      ? `${money(bankroll.max_daily_loss_usd)} (BYPASSED TODAY)`
+    ['Daily loss stop', bankroll.daily_loss_bypass_active
+      ? `${money(bankroll.max_daily_loss_usd)} (BYPASSED)`
       : money(bankroll.max_daily_loss_usd),
-      bankroll.paper_daily_loss_bypass_active ? 'neg' : ''],
+      bankroll.daily_loss_bypass_active ? 'neg' : ''],
     ['Hourly ROI target', `${spct(target.hourly_roi || 0)} / ${pct(target.hourly_roi_target || 0, 0)}`,
       (target.hourly_roi || 0) >= (target.hourly_roi_target || Infinity) ? 'pos' : ''],
     ['Daily profit target', `${money(target.daily_pnl_usd || 0)} / ${money(target.daily_profit_target_min_usd || 0)}\u2013${money(target.daily_profit_target_max_usd || 0)}`,
@@ -611,22 +723,26 @@ function renderProfile(s) {
     box.appendChild(t);
   }
 
-  const minConf = cfg.entry.min_confidence, minRoi = cfg.entry.min_expected_roi;
-  const qualityHtml = cfg.entry.profit_tuned
-    ? `<b>Profit-tuned override:</b> requires ${pct(minConf, 0)} confidence, an entry at or below ` +
-      `${Math.round(cfg.entry.max_entry_price * 100)}¢, and the first ${pct(cfg.entry.max_window_fraction, 0)} ` +
-      `of the window, with a hard ${money(cfg.entry.hard_market_window_cap_usd ?? cfg.entry.hard_window_cap_usd)} cap per market/window and ` +
-      `${money(cfg.entry.hard_window_cap_usd)} shared cap across all assets ` +
-      `in the same timed window, ${money(bankroll.max_open_exposure_usd)} maximum total open exposure, ` +
-      `and a ${money(bankroll.max_daily_loss_usd)} UTC-day loss stop on the ${money(bankroll.starting_balance_usd)} bankroll. ` +
-      `These filters replayed at 41.5% ROI on the reviewed LIVE cohort.`
-    : cfg.entry.confidence_only
-    ? `<b>Confidence-only override:</b> requires the ${pct(minConf, 0)} confidence floor plus the mandatory ` +
-      `${money(bankroll.starting_balance_usd)} bankroll limits. Exchange-enforced availability and fill requirements remain.`
-    : `<b>Quality targets:</b> every entry requires at least ${pct(minConf, 0)} model confidence and ` +
-      `${pct(minRoi, 0)} expected ROI after assumed costs. ` +
-      `Realized win rate: ${st.settlements ? pct(st.win_rate) : 'no data yet'}; ` +
-      `realized ROI: ${st.staked ? spct(st.roi) : 'no data yet'}.`;
+  const sc = cfg.strategy_config, lim = cfg.limits;
+  const qualityHtml =
+    `<b>@antsaslyku replication.</b> Buys either side at ` +
+    `${Math.round(sc.min_entry_price * 100)}–${Math.round(sc.max_entry_price * 100)}¢ whenever the model ` +
+    `prices it above the all-in cost, in flat ${money(sc.base_clip_usd)} clips, held to resolution — ` +
+    `the wallet never sold once in 569,015 fills. ` +
+    `Ladder up to ${sc.max_fills_per_window} fills per window; hedging ` +
+    `<b>${sc.hedge_enabled ? 'ON' : 'OFF'}</b>. ` +
+    `A claimed edge above ${Math.round(sc.max_model_edge * 100)} points is refused as a feed fault — ` +
+    `the wallet's largest real edge across 101,541 windows was 5.4 points. ` +
+    `Caps: ${money(lim.hard_market_window_cap_usd)} per market/window, ` +
+    `${money(lim.hard_window_cap_usd)} across all assets in one timed interval, ` +
+    `${money(bankroll.max_open_exposure_usd)} total open, ` +
+    `${money(bankroll.max_daily_loss_usd)} UTC-day loss stop on ${money(bankroll.starting_balance_usd)}.<br><br>` +
+    `<b>Measured on the wallet, not promised here:</b> replaying its own entries with flat ` +
+    `${money(sc.base_clip_usd)} clips in this band returned +3.50% ROI over 98,742 windows, positive in all ` +
+    `five months but decaying (+4.23% May → +1.55% Aug). This bot must reproduce the entry timing to earn ` +
+    `any of it. ` +
+    `Realized win rate: ${st.settlements ? pct(st.win_rate) : 'no data yet'}; ` +
+    `realized ROI: ${st.staked ? spct(st.roi) : 'no data yet'}.`;
   $('quality-box').innerHTML = dailyLossBlocked
     ? `<b>New entries stopped by the daily loss limit:</b> today's Paper P/L is ` +
       `${money(bankroll.daily_pnl_usd)} versus the ${money(bankroll.max_daily_loss_usd)} stop. ` +
@@ -641,28 +757,8 @@ function renderInfoCards(s) {
   const excludedLabel = excluded.length
     ? ` Disabled: ${excluded.map((row) => `${row.asset.toUpperCase()} ${row.window}`).join(' / ')}.`
     : '';
-  if (cfg.entry.profit_tuned) {
-    $('entry-label').textContent = 'Profit-tuned LIVE review filters';
-    $('entry-assets').textContent =
-      `${cfg.assets.map((a) => a.toUpperCase()).join(' / ')} · ${cfg.windows.join(' & ')} windows`;
-    $('entry-note').textContent =
-      `${pct(cfg.entry.min_confidence, 0)}+ confidence · max ${Math.round(cfg.entry.max_entry_price * 100)}¢ ` +
-      `· first ${pct(cfg.entry.max_window_fraction, 0)} of each window · ` +
-      `${money(cfg.entry.hard_market_window_cap_usd ?? cfg.entry.hard_window_cap_usd)} per market/window · ` +
-      `${money(cfg.entry.hard_window_cap_usd)} all-market interval cap · ` +
-      `${money(cfg.bankroll.max_open_exposure_usd)} total open cap · ` +
-      `${money(cfg.bankroll.max_daily_loss_usd)} daily loss stop. ` +
-      excludedLabel + ' ' +
-      'the legacy whitelist, entry-count, volatility, drawdown, rate, depth and ROI gates stay bypassed.';
-  } else if (cfg.entry.confidence_only) {
-    $('entry-label').textContent = 'Confidence-only entry override';
-    $('entry-assets').textContent =
-      `${cfg.assets.map((a) => a.toUpperCase()).join(' / ')} · ${cfg.windows.join(' & ')} windows`;
-    $('entry-note').textContent =
-      `Trades at ${pct(cfg.entry.min_confidence, 0)} confidence or higher and never above ${Math.round(cfg.entry.max_entry_price * 100)}¢. Mandatory per-trade, per-market/window, ` +
-      'shared-interval, wallet, open-exposure, daily-loss, and turnover caps remain active.' +
-      excludedLabel;
-  } else if (s.runtime.mode === 'live' && selection.enabled) {
+  const sc = cfg.strategy_config;
+  if (s.runtime.mode === 'live' && selection.enabled) {
     const eligible = selection.eligible || [];
     $('entry-label').textContent = 'Live paper-tested whitelist';
     $('entry-assets').textContent = eligible.length
@@ -678,10 +774,11 @@ function renderInfoCards(s) {
     $('entry-assets').textContent =
       `${cfg.assets.map((a) => a.toUpperCase()).join(' / ')} · ${cfg.windows.join(' & ')} windows`;
     $('entry-note').textContent =
-      `Reversal status: ${cfg.entry.reversal_enabled
-        ? `bounded confidence-gated side switches enabled above ${pct(cfg.entry.reversal_min_confidence, 0)}, ` +
-          `max ${cfg.entry.max_side_switches} per window; the final entry slot is reserved for a switch`
-        : 'disabled'}. Entries stop after ${pct(cfg.entry.max_window_fraction, 0)} of a window has elapsed.` +
+      `Entry band ${Math.round(sc.min_entry_price * 100)}–${Math.round(sc.max_entry_price * 100)}¢, ` +
+      `${money(sc.base_clip_usd)} flat clips, up to ${sc.max_fills_per_window} fills per window, ` +
+      `hedging ${sc.hedge_enabled ? 'ON' : 'OFF'}. ` +
+      `Entries run the whole window — the cloned wallet's first-fill ROI is highest in the last ` +
+      `decile (+16.19%), so there is no early cut-off.` +
       excludedLabel;
   }
 
@@ -734,32 +831,40 @@ function renderPrices(s) {
   }
 }
 
-function renderMaker(s) {
-  const mk = s.maker;
-  const card = $('maker-card');
-  // The panel is meaningless when the engine is running purely directional.
-  card.classList.toggle('hidden', !mk || (s.strategy !== 'maker' && s.strategy !== 'both'));
-  if (!mk) return;
+function renderStrategy(s) {
+  const st = (s.strategies || {}).antsaslyku;
+  const card = $('strategy-card');
+  card.classList.toggle('hidden', !st);
+  if (!st) return;
 
-  const inv = mk.inventory || [];
-  const quotes = mk.quotes || [];
-  $('cnt-inv').textContent = inv.length;
-  $('cnt-q').textContent = quotes.length;
+  const ladders = st.windows || [];
+  const rejections = Object.entries((st.stats || {}).rejections || {});
+  $('cnt-lad').textContent = ladders.length;
+  $('cnt-rej').textContent = rejections.length;
 
-  const pill = $('maker-pill');
-  pill.textContent = `${s.strategy.toUpperCase()} · ${quotes.length} RESTING`;
-  pill.className = `pill ${quotes.length ? 'ok' : ''}`;
+  const pill = $('strategy-pill');
+  pill.textContent = st.dry_run ? 'DRY RUN' : `LIVE LADDER · ${ladders.length} OPEN`;
+  pill.className = `pill ${st.dry_run ? 'warn' : (ladders.length ? 'ok' : '')}`;
 
+  const cfg = st.config || {};
+  const stats = st.stats || {};
+  const byStage = stats.by_stage || {};
   const metrics = [
-    ['Locked profit (open)', money(mk.open_locked_profit), mk.open_locked_profit > 0 ? 'pos' : '', 'risk-free, unsettled'],
-    ['Capital at work', money(mk.open_cost), '', `${inv.length} windows`],
-    ['Fills', String(mk.fills || 0), '', `${mk.quotes_placed || 0} quotes placed`],
-    ['Fill rate', mk.quotes_placed ? pct((mk.fills || 0) / mk.quotes_placed, 0) : '—', '', 'of quotes placed'],
-    ['Unpaired windows', String(mk.residual_windows || 0),
-      mk.residual_windows ? 'neg' : 'pos', 'carrying direction'],
-    ['Maker rebates', money(mk.rebates_usd || 0), 'pos', `${mk.requotes || 0} re-quotes`],
+    ['Capital at work', money(st.open_cost_usd),
+      '', `${st.open_windows} of ${cfg.max_open_windows} windows`],
+    ['Fills', String(stats.fills || 0),
+      '', `${byStage.open || 0} open · ${byStage.add || 0} add · ${byStage.hedge || 0} hedge`],
+    ['Clip', money(cfg.base_clip_usd), '',
+      `flat — measured $5.04 at every rung`],
+    ['Ladder cap', String(cfg.max_fills_per_window), '',
+      cfg.max_fills_per_window > 2 ? 'wallet-faithful (2 is peak ROI)' : 'profit-maximising'],
+    ['Hedging', cfg.hedge_enabled ? 'ON' : 'OFF',
+      cfg.hedge_enabled ? 'neg' : 'pos',
+      cfg.hedge_enabled ? 'clone: pairs cost ~$1.04' : 'first side only'],
+    ['Entry band', `${(cfg.min_entry_price * 100).toFixed(0)}–${(cfg.max_entry_price * 100).toFixed(0)}¢`,
+      '', `edge capped at ${(cfg.max_model_edge * 100).toFixed(0)}pts`],
   ];
-  const row = $('maker-metrics');
+  const row = $('strategy-metrics');
   row.innerHTML = '';
   for (const [label, value, klass, sub] of metrics) {
     const m = el('div', 'metric');
@@ -769,102 +874,69 @@ function renderMaker(s) {
     row.appendChild(m);
   }
 
-  // -- inventory
-  const tb = $('tb-maker');
+  // -- open ladders
+  const tb = $('tb-ladders');
   tb.innerHTML = '';
-  if (!inv.length) {
+  if (!ladders.length) {
     const tr = el('tr', 'empty');
     const td = el('td', '', s.runtime.running
-      ? 'Quotes are resting; nothing has been filled yet.'
+      ? 'Scanning; no window has been entered yet.'
       : 'Engine offline.');
-    td.colSpan = 8;
+    td.colSpan = 6;
     tr.appendChild(td); tb.appendChild(tr);
   }
-  for (const i of inv.sort((a, b) => b.locked_profit - a.locked_profit)) {
+  for (const w of ladders.sort((a, b) => b.cost_usd - a.cost_usd)) {
+    const parts = (w.slug || '').split('-');
+    const asset = parts[0] || '?';
+    const window = parts[2] || '';
     const tr = el('tr');
 
     const c0 = el('td');
     const cell = el('div', 'asset-cell');
-    cell.appendChild(assetIcon(i.asset, 24));
+    cell.appendChild(assetIcon(asset, 24));
     const nm = el('div');
-    nm.appendChild(el('div', 'mkt-name', `${i.asset.toUpperCase()} ${i.window}`));
-    nm.appendChild(el('div', 'mkt-sub', `${i.fills} fill${i.fills === 1 ? '' : 's'} · ${money(i.total_cost)} in`));
+    nm.appendChild(el('div', 'mkt-name', `${asset.toUpperCase()} ${window}`));
+    const legs = Object.entries(w.side_cost || {})
+      .map(([k, v]) => `${k} ${money(v)}`).join(' · ');
+    nm.appendChild(el('div', 'mkt-sub', legs || '—'));
     cell.appendChild(nm);
     c0.appendChild(cell);
     tr.appendChild(c0);
 
-    tr.appendChild(el('td', 'r mono', i.shares_up
-      ? `${i.shares_up.toFixed(1)} @ ${(i.avg_up * 100).toFixed(0)}¢` : '—'));
-    tr.appendChild(el('td', 'r mono', i.shares_down
-      ? `${i.shares_down.toFixed(1)} @ ${(i.avg_down * 100).toFixed(0)}¢` : '—'));
+    tr.appendChild(el('td', 'r mono', String(w.fills)));
+    tr.appendChild(el('td', 'r mono', money(w.cost_usd)));
 
-    // Pair cost is the whole game: under 100¢ is locked profit.
-    const c3 = el('td', `r mono ${i.pair_cost && i.pair_cost < 1 ? 'pos-c' : (i.pair_cost ? 'neg-c' : 'dim')}`);
-    c3.textContent = i.pair_cost ? `${(i.pair_cost * 100).toFixed(1)}¢` : '—';
-    tr.appendChild(c3);
+    const sd = el('td');
+    if (w.first_side) sd.appendChild(el('span', `badge ${w.first_side}`, w.first_side.toUpperCase()));
+    else sd.textContent = '—';
+    tr.appendChild(sd);
 
-    const c4 = el('td');
-    if (i.locked_shares > 0) {
-      const top = el('div', 'wrtop');
-      top.appendChild(el('span', 'wrpct', `${i.locked_shares.toFixed(1)} pairs`));
-      top.appendChild(el('span', 'mkt-sub', `${((1 - i.pair_cost) * 100).toFixed(1)}¢ each`));
-      c4.appendChild(top);
-      const bar = el('div', 'wrbar');
-      const fill = el('div', 'wrfill good');
-      const paired = i.shares_up + i.shares_down;
-      fill.style.width = `${Math.round((2 * i.locked_shares / Math.max(paired, 1e-9)) * 100)}%`;
-      bar.appendChild(fill);
-      c4.appendChild(bar);
-    } else {
-      c4.className = 'dim';
-      c4.textContent = 'no pair yet';
-    }
-    tr.appendChild(c4);
-
-    tr.appendChild(el('td', `r mono ${i.locked_profit > 0 ? 'pos-c' : 'dim'}`,
-      i.locked_profit ? signedMoney(i.locked_profit) : '—'));
-
-    const c6 = el('td');
-    if (i.residual_side) {
-      c6.appendChild(el('span', `badge ${i.residual_side}`, i.residual_side.toUpperCase()));
-      c6.appendChild(el('div', 'mkt-sub', `${i.residual_shares.toFixed(1)} unpaired`));
-    } else {
-      c6.className = 'pos-c';
-      c6.textContent = 'flat';
-    }
-    tr.appendChild(c6);
-
-    tr.appendChild(el('td', 'r mono dim', `${Math.max(0, i.seconds_remaining)}s`));
+    // Two sides held is the hedge: the pair pays $1 however it resolves, so
+    // paying more than that for it is the loss the measurement identified.
+    tr.appendChild(el('td', `r mono ${w.sides_held > 1 ? 'neg-c' : 'pos-c'}`,
+      String(w.sides_held)));
+    tr.appendChild(el('td', 'r mono dim', String(w.adverse_streak || 0)));
     tb.appendChild(tr);
   }
 
-  // -- resting quotes
-  const tq = $('tb-quotes');
-  tq.innerHTML = '';
-  if (!quotes.length) {
+  // -- rejections
+  const tr2 = $('tb-rejections');
+  tr2.innerHTML = '';
+  if (!rejections.length) {
     const tr = el('tr', 'empty');
-    const td = el('td', '', 'No resting quotes.'); td.colSpan = 6;
-    tr.appendChild(td); tq.appendChild(tr);
+    const td = el('td', '', 'Nothing declined yet.'); td.colSpan = 2;
+    tr.appendChild(td); tr2.appendChild(tr);
   }
-  for (const q of quotes) {
+  for (const [reason, count] of rejections.sort((a, b) => b[1] - a[1])) {
     const tr = el('tr');
-    const c0 = el('td');
-    const cell = el('div', 'asset-cell');
-    cell.appendChild(assetIcon(q.asset, 22));
-    cell.appendChild(el('span', '', `${q.asset.toUpperCase()} ${q.window}`));
-    c0.appendChild(cell);
-    tr.appendChild(c0);
-    const sd = el('td');
-    sd.appendChild(el('span', `badge ${q.side}`, q.side.toUpperCase()));
-    tr.appendChild(sd);
-    tr.appendChild(el('td', 'r mono', `${(q.price * 100).toFixed(0)}¢`));
-    tr.appendChild(el('td', 'r mono', money(q.size_usd)));
-    tr.appendChild(el('td', 'r mono dim', q.shares.toFixed(1)));
-    tr.appendChild(el('td', 'r mono dim', `${q.age_seconds.toFixed(0)}s`));
-    tq.appendChild(tr);
+    tr.appendChild(el('td', '', reason));
+    tr.appendChild(el('td', 'r mono', String(count)));
+    tr2.appendChild(tr);
   }
 
-  $('maker-note').textContent = mk.fill_model_note || '';
+  $('strategy-note').textContent =
+    `Scanned ${stats.scans || 0} times, ${stats.intents || 0} tradeable, `
+    + `${money(stats.cost_usd || 0)} staked this session.`;
 }
 
 function renderPositions(s) {
@@ -889,7 +961,7 @@ function renderPositions(s) {
   if (!rows.length) {
     const tr = el('tr', 'empty');
     const bank = s.bankroll || {};
-    const dailyLossBlocked = !bank.paper_daily_loss_bypass_active &&
+    const dailyLossBlocked = !bank.daily_loss_bypass_active &&
       Number(bank.daily_pnl_usd || 0) <= -Math.abs(Number(bank.max_daily_loss_usd || 0));
     const td = el('td', '', !s.runtime.running
       ? 'Engine offline.'
@@ -1206,8 +1278,8 @@ async function refreshWinLoss() {
   try {
     const range = encodeURIComponent(state.wlRange);
     const [{ rows }, { settlements, summary: rangeSummary }] = await Promise.all([
-      api(`/api/by-asset?range=${range}`),
-      api(`/api/settlements?limit=200&range=${range}`),
+      api(`/api/by-asset?range=${range}&${scopeQuery()}`),
+      api(`/api/settlements?limit=200&range=${range}&${scopeQuery()}`),
     ]);
 
     // ---- summary strip -------------------------------------------------
@@ -1362,41 +1434,70 @@ async function refreshWinLoss() {
 
 function renderControls(s) {
   const rt = s.runtime, risk = s.risk;
-  const confidenceOnly = Boolean(s.config.entry.confidence_only);
-  const profitTuned = Boolean(s.config.entry.profit_tuned);
-  const entryOverride = confidenceOnly || profitTuned;
+  // The literal clone ladders and hedges, which is the capital-hungry
+  // configuration; flag it so the risk panel says which variant is armed.
+  const sc = s.config.strategy_config || {};
+  const faithful = Boolean(sc.hedge_enabled) || Number(sc.max_fills_per_window) > 2;
 
-  $('risk-pill').textContent = profitTuned ? 'PROFIT TUNED' : (confidenceOnly ? 'OVERRIDDEN' : 'APPLIED');
-  $('risk-pill').className = `pill ${entryOverride ? 'warn' : 'ok'}`;
+  $('risk-pill').textContent = faithful ? 'CLONE — FULL LADDER' : 'APPLIED';
+  $('risk-pill').className = `pill ${faithful ? 'warn' : 'ok'}`;
   $('sl-window').disabled = false;
   $('sl-daily').disabled = false;
-  $('trade-limit-note').textContent = entryOverride
-    ? 'This mandatory per-trade ceiling remains active in override mode and is shared by Paper and Live.'
-    : 'A hard ceiling on any one clip. Applies to the next clip and is shared by Paper and Live.';
-  $('daily-limit-note').textContent = entryOverride
-    ? 'This mandatory turnover ceiling remains active in override mode and resets at 00:00 UTC.'
-    : 'Total stake the engine may deploy per UTC day across every asset. Resets at 00:00 UTC.';
+  $('trade-limit-note').textContent =
+    'A hard ceiling on any one clip. Applies to the next clip and is shared by Paper and Live.';
+  $('daily-limit-note').textContent =
+    'Total stake the engine may deploy per UTC day across every asset. Resets at 00:00 UTC.';
 
   $('btn-pause').textContent = rt.paused ? 'Resume trading' : 'Pause trading';
   const tp = $('trading-pill');
   tp.textContent = rt.paused ? 'PAUSED' : 'TRADING';
   tp.className = `pill ${rt.paused ? 'warn' : 'ok'}`;
 
+  const bank = s.bankroll || {};
+  const bypassActive = Boolean(bank.daily_loss_bypass_active);
+  const bypassScope = String(bank.daily_loss_bypass_scope || 'hour');
+  const lossLimit = Math.abs(Number(bank.max_daily_loss_usd || 0));
+  const dayPnl = Number(bank.daily_pnl_usd || 0);
+  const atLossStop = lossLimit > 0 && dayPnl <= -lossLimit;
+  const modeLabel = String(rt.mode || 'paper').toUpperCase();
+  const minsLeft = Math.max(0, Math.ceil(
+    (Number(bank.daily_loss_bypass_until || 0) * 1000 - Date.now()) / 60000));
+  const hourBtn = $('btn-loss-bypass');
+  const dayBtn = $('btn-loss-bypass-day');
+  hourBtn.textContent = bypassActive && bypassScope === 'hour'
+    ? `Loss stop bypassed · ${minsLeft}m left`
+    : 'Bypass daily loss stop (1h)';
+  dayBtn.textContent = bypassActive && bypassScope === 'day'
+    ? 'Bypassed until 00:00 UTC'
+    : 'Bypass for the day';
+  // Re-firing while one is already running would only restate the same window,
+  // so both stay out of the way until the current one lapses.
+  hourBtn.disabled = bypassActive;
+  dayBtn.disabled = bypassActive;
+  const heldFor = bypassScope === 'day'
+    ? 'until the 00:00 UTC reset, with no earlier expiry'
+    : `for another ${minsLeft} minute(s), then it re-engages on its own`;
+  $('loss-bypass-note').innerHTML = bypassActive
+    ? `<b>${modeLabel} loss stop bypassed:</b> new entries are allowed past the ` +
+      `${money(lossLimit)} stop ${heldFor}. Today's P/L is still ${signedMoney(dayPnl)}.`
+    : atLossStop
+      ? `<b>Currently stopped:</b> today's P/L is ${signedMoney(dayPnl)} against the ` +
+        `${money(lossLimit)} stop. Bypassing lets ${modeLabel} open new positions — ` +
+        `for one hour, or for the rest of the UTC day.`
+      : `Overrides the ${money(lossLimit)} daily loss stop for one hour, or for the rest ` +
+        `of the UTC day. Applies to whichever mode is running — currently ${modeLabel}.`;
+
   const anyHalted = Object.values(risk.regimes || {}).some((r) => r.halted);
-  const halted = !entryOverride && (risk.breaker_active || anyHalted);
+  const halted = risk.breaker_active || anyHalted;
 
   const box = $('regime-box');
   const st = $('regime-state');
   box.className = `regime ${halted ? 'halted' : ''}`;
   st.className = `regime-state ${halted ? 'halted' : ''}`;
-  st.textContent = entryOverride
-    ? 'BYPASSED'
-    : (risk.breaker_active ? 'HALTED' : (anyHalted ? 'PARTIAL' : 'NORMAL'));
+  st.textContent =
+    risk.breaker_active ? 'HALTED' : (anyHalted ? 'PARTIAL' : 'NORMAL');
 
-  if (entryOverride) {
-    $('regime-note').textContent =
-      'Volatility and drawdown states are informational and do not block profit-tuned entries.';
-  } else if (risk.breaker_active) {
+  if (risk.breaker_active) {
     $('regime-note').textContent =
       `${risk.breaker_reason || 'Hourly loss breaker tripped.'} Resuming in ${risk.breaker_seconds_remaining}s.`;
   } else if (anyHalted) {
@@ -1419,11 +1520,10 @@ function renderControls(s) {
       r.vol_bps === null || r.vol_bps === undefined ? '—' : r.vol_bps.toFixed(1)));
     vr.appendChild(t);
   }
-  $('vol-note').textContent = entryOverride
-    ? 'Volatility is shown for information only and does not halt profit-tuned entries.'
-    : `Realized volatility of each underlying over the last 15 minutes, in bps. Above ` +
-      `${risk.halt_above_bps} an asset stops opening new windows — the lead/lag edge degrades in that ` +
-      `regime. It resumes below ${risk.resume_below_bps}. Windows already open keep trading.`;
+  $('vol-note').textContent =
+    `Realized volatility of each underlying over the last 15 minutes, in bps. Above ` +
+    `${risk.halt_above_bps} an asset stops opening new windows — the lead/lag edge degrades in that ` +
+    `regime. It resumes below ${risk.resume_below_bps}. Windows already open keep trading.`;
 }
 
 function renderVaultState(s) {
@@ -1564,9 +1664,46 @@ function wire() {
       }
       try {
         await api('/api/engine/mode', { method: 'POST', body: JSON.stringify({ mode }) });
+        // Re-scope immediately. Waiting for the next poll would leave the
+        // tables showing the previous mode's numbers beside the new mode's
+        // headline figure.
+        state.lastMode = mode;
+        rescope({});
         toast(`Execution mode: ${mode}`, mode === 'live' ? 'warn' : 'ok');
       } catch (e) { toast(e.message, 'err'); }
     });
+  });
+
+  // Delegated: the segment is rebuilt whenever the available strategies change.
+  $('strategy-seg').addEventListener('click', async (ev) => {
+    const b = ev.target.closest('.seg-btn');
+    if (!b) return;
+    const name = b.dataset.strategy;
+    if (name === state.strategy) return;
+
+    const sel = (state.snap && state.snap.strategy_selection) || {};
+    const configured = sel.configured || [];
+
+    // In Live the segment is not a view filter — it decides which strategy is
+    // allowed to spend real money, so it must be confirmed and pushed to the
+    // engine before the view follows.
+    if (sel.exclusive && name !== 'all' && configured.includes(name)) {
+      const ok = confirm(
+        `Switch the LIVE strategy to ${strategyLabel(name)}?\n\n` +
+        'Live runs exactly one strategy. ' +
+        `${strategyLabel(sel.selected || '—')} will stop taking new entries ` +
+        `and ${strategyLabel(name)} will start.\n\n` +
+        'Open positions are unaffected — they settle into their own strategy.\n\nContinue?');
+      if (!ok) return;
+      try {
+        await api('/api/strategy', {
+          method: 'POST', body: JSON.stringify({ strategy: name }),
+        });
+        toast(`Live strategy: ${strategyLabel(name)}`, 'warn');
+      } catch (e) { toast(e.message, 'err'); return; }
+    }
+
+    rescope({ strategy: name });
   });
 
   const bindSlider = (id, field, mirror) => {
@@ -1655,6 +1792,38 @@ function wire() {
     } catch (e) { toast(e.message, 'err'); }
   });
 
+  async function fireLossBypass(scope) {
+    const snap = state.snap;
+    const mode = (snap && snap.runtime.mode) || 'paper';
+    const limit = Math.abs(Number((snap && snap.bankroll.max_daily_loss_usd) || 0));
+    const held = scope === 'day' ? 'the rest of the UTC day' : 'one hour';
+    // In Live the loss stop is the last automatic backstop on real money, so
+    // overriding it should be a deliberate act rather than one stray click.
+    // Paper costs nothing, so it fires straight away.
+    if (mode === 'live' && !confirm(
+      `Bypass the LIVE ${money(limit)} daily loss stop for ${held}?\n\n` +
+      'The engine will keep opening real-money positions even though today\'s ' +
+      'loss limit is already reached.' +
+      (scope === 'day'
+        ? '\n\nThis one does not expire on its own before 00:00 UTC.'
+        : '\n\nIt re-engages automatically after 60 minutes.')
+    )) return;
+    try {
+      const r = await api('/api/risk/daily-loss-bypass', {
+        method: 'POST',
+        body: JSON.stringify({ scope }),
+      });
+      toast(
+        `${String(r.mode).toUpperCase()} daily loss stop bypassed for ` +
+        (r.daily_loss_bypass_scope === 'day' ? 'the rest of the day' : '60 minutes'),
+        'warn',
+      );
+    } catch (e) { toast(e.message, 'err'); }
+  }
+
+  $('btn-loss-bypass').addEventListener('click', () => fireLossBypass('hour'));
+  $('btn-loss-bypass-day').addEventListener('click', () => fireLossBypass('day'));
+
   document.querySelectorAll('#range-tabs button').forEach((b) => {
     b.addEventListener('click', async () => {
       document.querySelectorAll('#range-tabs button').forEach((x) => x.classList.remove('active'));
@@ -1664,7 +1833,7 @@ function wire() {
       // Repaint from a direct fetch rather than waiting up to a second for the
       // reopened stream, so the button feels like it did something.
       try {
-        const snap = await api(`/api/state?range=${state.range}`);
+        const snap = await api(`/api/state?range=${state.range}&${scopeQuery()}`);
         state.snap = snap;
         render(snap);
       } catch { /* the stream will catch up */ }
@@ -1696,12 +1865,12 @@ function wire() {
     });
   });
 
-  document.querySelectorAll('#maker-subtabs .subtab').forEach((b) => {
+  document.querySelectorAll('#strategy-subtabs .subtab').forEach((b) => {
     b.addEventListener('click', () => {
-      document.querySelectorAll('#maker-subtabs .subtab').forEach((x) => x.classList.remove('active'));
+      document.querySelectorAll('#strategy-subtabs .subtab').forEach((x) => x.classList.remove('active'));
       b.classList.add('active');
-      $('mk-inventory').classList.toggle('hidden', b.dataset.mk !== 'inventory');
-      $('mk-quotes').classList.toggle('hidden', b.dataset.mk !== 'quotes');
+      $('st-ladders').classList.toggle('hidden', b.dataset.st !== 'ladders');
+      $('st-rejections').classList.toggle('hidden', b.dataset.st !== 'rejections');
     });
   });
 

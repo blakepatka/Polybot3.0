@@ -50,81 +50,106 @@ repriced the drift.
 
 ---
 
-## What was measured about strategy viability
+## The strategy: a measured replication of one wallet
 
-A live profile trading these same windows shows $150k across 79,304 trades. Its
-activity — both sides of one window, fills well inside the spread, 1c tail buys
-— pointed at market making. Three things were then measured directly.
+There is exactly one strategy in this project. It replicates Polymarket wallet
+[`0x3c58…776b`](https://polymarket.com/profile/@antsaslyku) (@antsaslyku), and
+every parameter is measured from a complete scrape of that wallet's public
+history rather than chosen:
 
-**1. A two-sided basket is only profitable as a maker.** Up + Down always pays
-exactly $1, so a pair bought below $1 is locked profit with no directional risk.
-Across 532 samples of live books (7 assets, 5m/15m, 4 minutes):
+| | |
+|---|---|
+| Activity rows | **654,200** |
+| Period | 2026-04-24 → 2026-08-15 (**113 days**) |
+| Fills / redemptions | 569,015 / 85,001 |
+| Turnover | **$4,190,784** |
+| Windows reconstructed to a known winner | **101,541** |
 
-| | Below $1 | Median |
-|---|---|---|
-| Crossing the spread (`ask + ask`) | **0 / 532** | 1.020 |
-| Resting at the bid (`bid + bid`) | **532 / 532** | 0.980 |
+**What it does.** btc/eth/sol/xrp on 5m (86.7% of fills) and 15m — 184 of
+654,200 rows touch any other slug. Flat $5 clips. Every one of the 569,015
+fills is a taker BUY; there is not a single SELL, so positions are held to
+resolution and redeemed. First fill lands a median 53s into the window (p10 7s,
+p90 291s, earliest 2s) at a median price of 0.540, and entries run the full
+length of the window.
 
-**2. Takers pay ~7%; makers pay nothing.** The market's own
-`feeSchedule` is `{rate: 0.07, takerOnly: true}` with
-`makerRebatesFeeShareBps: 10000`. The fee scales with `min(p, 1-p)`, so it is
-worst at coin-flip prices — exactly where a directional model wants to trade. A
-taker at 50c needs **53.5%** to break even; a maker needs 50%.
+**Where the edge is.** It buys at price `p` and wins at about `p + 0.03`:
 
-**3. Liquidity rewards do not apply here.** Gamma reports
-`rewardsMaxSpread: 4.5` and `rewardsMinSize: 50` on these markets, but the
-venue's reward register (`/rewards/markets/current`, 8,960 markets over 18
-pages) contains **none** of the short crypto windows, and the per-market lookup
-returns empty. Those Gamma fields are template defaults. No reward income is
-modelled anywhere in this project.
-
-### Measured results (16 minutes, same live data, separate databases)
-
-| Strategy | Settled | Win rate | P/L | ROI |
+| Entry price | n | Avg paid | Win rate | Edge |
 |---|---|---|---|---|
-| Directional (fees modelled) | 18 | 61.1% | −$1.89 | **−2.10%** |
-| Maker | 16 | 56.2% | +$120.61 | +67.32% |
+| 0.05–0.10 | 493 | 0.074 | 0.128 | **+0.054** |
+| 0.20–0.30 | 3,039 | 0.251 | 0.295 | +0.044 |
+| 0.50–0.55 | 19,834 | 0.519 | 0.554 | +0.035 |
+| 0.70–0.75 | 6,016 | 0.718 | 0.742 | +0.024 |
+| 0.80–0.85 | 1,630 | 0.816 | 0.814 | −0.002 |
 
-**The maker figure is one trade, not an edge.** A single DOGE 5m fill of 125
-shares at 3.7c paid $125.00 for $4.65. The other fifteen settlements together
-came to **+$0.26**. The losing settlements are the same bet missing: −$13.85 at
-13.2c, −$11.95 at 7.7c, −$8.00 at 12.2c. That is a lottery-ticket distribution,
-and sixteen samples cannot show whether it is profitable.
+That is a latency edge — lifting asks the spot move has already invalidated but
+the book has not yet repriced — worth roughly three points of probability, and
+it is **gone above 0.80**. Hence the 0.02–0.85 band.
 
-The directional result is more informative: a 61% win rate that still loses
-money is the taker fee doing exactly what the arithmetic above predicts.
+**It is not arbitrage.** Across its 52,816 two-sided windows the first fill and
+the hedge together cost a median **$1.042**, and only 35.6% of those pairs came
+in under $1.00. Buying both sides of a binary for more than $1 is not a lock; it
+is paying a premium to flatten a losing window.
 
-**Neither strategy here is demonstrated to be profitable.** Treat both as
-instrumented experiments.
+**The ladder and the hedge cost capital, not P/L.** Holding the wallet's own
+entry decisions fixed and varying only the follow-through, over all 101,541
+resolved windows:
 
-### Confirmed side switching
+| Follow-through | Cost | Net | ROI |
+|---|---|---|---|
+| As traded (ladder + hedge) | $4,188,506 | +$85,916 | +2.05% |
+| First side only, no hedge | $2,734,654 | +$55,186 | +2.02% |
+| First side, max 3 fills | $1,534,037 | +$39,316 | +2.56% |
+| **First side, max 2 fills** | $1,188,936 | +$32,369 | **+2.72%** |
+| First fill only | $708,244 | +$19,036 | +2.69% |
 
-Directional Paper trading has an optional path that reserves one entry slot for
-a single opposite-side leg when the model changes direction. The new signal must
-remain tradeable for three scans spanning at least six seconds, clear the
-configured confidence and fee-adjusted expected-ROI floors, and pass the normal
-per-trade, timed-window, open-exposure, turnover, and loss controls. The second
-leg uses the normal clip; it does not buy equal shares and call the result a
-hedge, because crossing both asks plus taker fees usually locks a loss.
+The hedge deploys 5.9x the capital for the same return per dollar. Note that
+the widely-quoted "single-sided windows returned +23.5%" is a **selection
+artefact**: the wallet only *stays* single-sided in windows that went its way,
+so conditioning on that conditions on the outcome.
 
-Historical explicit-reversal windows have not passed the two-block evidence
-gate, so both `reversal_enabled` and `reversal_live_enabled` default to `false`.
-The code remains available for a future controlled Paper forward test. A side
-switch can improve or worsen a result; it does not guarantee a profit or an
-hourly ROI.
+Replayed with a flat $5 clip on the wallet's own entries in the 0.02–0.85 band,
+the rule returns **+3.50% ROI over 98,742 windows**, positive in all five
+calendar months but decaying: +4.23% (May), +5.34% (Jun), +2.62% (Jul), +1.55%
+(Aug).
 
-When `require_evidence_qualified_market` is enabled, a static allowlist is not
-enough to place an entry. The exact asset/window Paper cohort is checked again
-against the latest 100 settlements: both the newest 50 and preceding 50 must
-have positive fee-adjusted ROI. This rolling gate prevents a previously strong
-market from continuing to trade after its recent evidence turns negative.
+**Takers pay ~7%; makers pay nothing.** The market's own `feeSchedule` is
+`{rate: 0.07, takerOnly: true}`. The fee scales with `min(p, 1-p)`, so it is
+worst at coin-flip prices — exactly where this strategy trades. A taker at 50c
+needs **53.5%** to break even. Every ROI above is already fee-inclusive:
+`usdcSize/(shares*price)` averages 1.0245 across the 569,015 real fills.
 
-An exact cohort can be listed in `paper_experimental_markets` for controlled
-forward testing before it qualifies, but only in Paper and only at or above
-`paper_experimental_min_confidence` (90% by default). `asset_min_confidence` supplies the matching
-per-asset floor. The exception never bypasses static exclusions, price/timing
-filters, order-book checks, or any exposure and loss control, and it does not
-make the cohort Live-eligible.
+**Liquidity rewards do not apply here.** Gamma reports `rewardsMaxSpread: 4.5`
+and `rewardsMinSize: 50` on these markets, but the venue's reward register
+(`/rewards/markets/current`, 8,960 markets over 18 pages) contains **none** of
+the short crypto windows. Those Gamma fields are template defaults. No reward
+income is modelled anywhere in this project.
+
+### The edge cap is the load-bearing safety gate
+
+The strategy buys down to 2c, because the wallet's cheapest entries are its most
+profitable. That removes the price floor this repo previously relied on, so
+`max_model_edge` replaces it: any entry where our probability exceeds the book's
+all-in cost by more than 0.25 is refused.
+
+Our probability and the book's price are two estimates of the same quantity.
+When they disagree by tens of points the near-certain explanation is that our
+spot feed is wrong, not that the venue is mispricing a five-minute window by
+50x. The wallet's largest real edge across 101,541 windows was **+0.054**. The
+cap is clamped in code, not merely defaulted, so configuration cannot raise it.
+
+### Two configurations
+
+`config.json` ships the **literal clone** — `max_fills_per_window: 40`,
+`hedge_enabled: true`, `hedge_max_combined_cost: 99.0` — by operator decision on
+2026-08-15, reproducing the wallet including the parts that lose money. To trade
+the measured-profitable subset instead, set `max_fills_per_window: 2` and
+`hedge_enabled: false`; or keep hedging but set `hedge_max_combined_cost: 1.0`
+so the second leg can only ever lock a profit.
+
+At a $50 bankroll the clone's ladder is truncated by the mandatory bankroll
+controls long before its own fill cap: the wallet's median window costs $19.28
+and its p90 is $96.43.
 
 ## Honest limitations
 
@@ -151,14 +176,19 @@ them would let an unearned tier turn a losing strategy into a profitable-looking
 one, so the dashboard reports trading P/L only.
 
 **A small sample means nothing.** The "Candidate model trust" card stays red
-until 300 settled windows, because a 12-window run at 83% is noise. When a
-strategy's returns are dominated by rare large payoffs — as the maker's are —
-even 300 windows may not be enough.
+until 300 settled windows, because a 12-window run at 83% is noise.
 
-**Maker fill rates are optimistic.** A resting order is modelled as filled when
-the market trades strictly through its price, which stands in for the whole
-queue at that level clearing. Real queue priority is not simulated, and the
-observed 2.8% fill rate came with ~130 re-quotes per minute — a rate that would
+**The measurement is of the wallet, not of this bot.** Every ROI quoted above
+replays the wallet's *own* entries. This project has to generate its own from
+`polybot/signal.py`, and whether our feed is fast enough to capture the same
+three points is exactly the open question Paper exists to answer. An edge of
++2 to +3% per settled window does not survive much extra latency or cost, and
+the wallet's own edge has been shrinking month over month.
+
+**Legacy note on fill modelling.** An earlier build modelled resting maker
+orders as filled when the market traded strictly through their price, which
+stood in for the whole queue at that level clearing. Real queue priority was not
+simulated, and the observed 2.8% fill rate came with ~130 re-quotes per minute — a rate that would
 meet API limits in live trading.
 
 ---

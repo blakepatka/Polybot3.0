@@ -4,6 +4,12 @@ Paper and live rows live in the same tables with a ``mode`` discriminator, and
 every read is filtered by mode. Mixing paper fills into a live P/L (or the
 reverse) would make the headline number meaningless, so the filter is applied
 at the query level rather than left to callers to remember.
+
+Rows carry a second discriminator, ``strategy``, for the same reason. Paper is
+allowed to run several strategies at once so their curves can be compared over
+identical windows, and a P/L that silently blends them would answer no question
+at all. ``strategy=None`` on any read means "every strategy", which is what the
+dashboard's All view and every pre-existing caller ask for.
 """
 
 from __future__ import annotations
@@ -35,7 +41,9 @@ CREATE TABLE IF NOT EXISTS positions (
     switches      INTEGER NOT NULL DEFAULT 0,
     status        TEXT    NOT NULL DEFAULT 'open',
     order_id      TEXT,
-    question      TEXT
+    question      TEXT,
+    strategy      TEXT    NOT NULL DEFAULT 'directional',
+    anchor_source TEXT
 );
 
 CREATE TABLE IF NOT EXISTS settlements (
@@ -56,7 +64,9 @@ CREATE TABLE IF NOT EXISTS settlements (
     anchor_price  REAL,
     close_price   REAL,
     settled_at    REAL    NOT NULL,
-    method        TEXT
+    method        TEXT,
+    strategy      TEXT    NOT NULL DEFAULT 'directional',
+    anchor_source TEXT
 );
 
 CREATE TABLE IF NOT EXISTS activity (
@@ -81,6 +91,18 @@ CREATE INDEX IF NOT EXISTS idx_settle_time  ON settlements(mode, settled_at);
 CREATE INDEX IF NOT EXISTS idx_activity_ts  ON activity(mode, ts);
 """
 
+# Applied after SCHEMA so they exist whether the column arrived via CREATE
+# (fresh database) or via the migration below (existing one).
+STRATEGY_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_pos_strategy    ON positions(mode, strategy, status);
+CREATE INDEX IF NOT EXISTS idx_settle_strategy ON settlements(mode, strategy, settled_at);
+"""
+
+# Every strategy that has ever written rows carries its own name here. The
+# default matches the only pipeline that existed before the column did, so an
+# ALTER on a populated database labels the entire back history correctly.
+DEFAULT_STRATEGY = "directional"
+
 
 class Store:
     def __init__(self, path: Path | None = None) -> None:
@@ -95,7 +117,60 @@ class Store:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._migrate_strategy_column()
+            self._migrate_anchor_source_column()
+            self._conn.executescript(STRATEGY_INDEXES)
             self._conn.commit()
+
+    # -- migrations --------------------------------------------------------
+
+    def _has_column(self, table: str, column: str) -> bool:
+        rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(r["name"] == column for r in rows)
+
+    def _migrate_strategy_column(self) -> None:
+        """Add the per-strategy discriminator to databases that predate it.
+
+        Purely additive: ``ADD COLUMN`` with a NOT NULL default rewrites no
+        existing value and cannot fail partway through in a way that loses a
+        row. Every historical row is labelled ``directional`` because that is
+        the only entry pipeline that wrote positions before this column
+        existed. Maker settlements are then relabelled from their own
+        ``method`` marker, which is the one unambiguous record of their origin.
+        """
+        for table in ("positions", "settlements"):
+            if not self._has_column(table, "strategy"):
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN strategy TEXT NOT NULL "
+                    f"DEFAULT '{DEFAULT_STRATEGY}'"
+                )
+
+        # The maker pipeline never wrote a positions row — it settles straight
+        # from its own inventory — so only settlements need correcting, and
+        # `method` identifies them exactly.
+        self._conn.execute(
+            "UPDATE settlements SET strategy='maker' "
+            "WHERE method='maker' AND strategy=?",
+            (DEFAULT_STRATEGY,),
+        )
+
+    def _migrate_anchor_source_column(self) -> None:
+        """Record which price series a window was anchored on.
+
+        A position is settled by comparing its anchor against a close price,
+        and the two must be read from the same feed. Storing the anchor's
+        source is what lets settlement guarantee that across a restart, when
+        the engine's in-memory anchor table is empty.
+
+        Left NULL for rows written before the column existed. NULL means
+        "unknown", not "exchange": those windows were anchored from a buffer
+        that blended both feeds, so the honest record is that we cannot say.
+        """
+        for table in ("positions", "settlements"):
+            if not self._has_column(table, "anchor_source"):
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN anchor_source TEXT"
+                )
 
     def close(self) -> None:
         with self._lock:
@@ -229,9 +304,12 @@ class Store:
         cols = (
             "mode", "slug", "asset", "window", "side", "confidence", "entry_price",
             "shares", "stake_usd", "anchor_price", "opened_at", "window_end",
-            "switches", "order_id", "question",
+            "switches", "order_id", "question", "anchor_source", "strategy",
         )
+        # `strategy` is NOT NULL, and a caller that predates the column must not
+        # be able to write a null into it.
         values = [kw.get(c) for c in cols]
+        values[-1] = kw.get("strategy") or DEFAULT_STRATEGY
         with self._lock:
             cur = self._conn.execute(
                 f"INSERT INTO positions ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
@@ -258,9 +336,11 @@ class Store:
         cols = (
             "position_id", "mode", "slug", "asset", "window", "side", "confidence",
             "entry_price", "shares", "stake_usd", "payout_usd", "pnl_usd", "won",
-            "anchor_price", "close_price", "settled_at", "method",
+            "anchor_price", "close_price", "settled_at", "method", "anchor_source",
+            "strategy",
         )
         values = [kw.get(c) for c in cols]
+        values[-1] = kw.get("strategy") or DEFAULT_STRATEGY
         with self._lock:
             cur = self._conn.execute(
                 f"INSERT INTO settlements ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
@@ -268,6 +348,36 @@ class Store:
             )
             self._conn.commit()
             return int(cur.lastrowid)
+
+    def provisional_settlements(self, since: float) -> list[dict[str, Any]]:
+        """Settlements decided by the spot proxy that the venue could correct.
+
+        The venue publishes an outcome long after a window closes — minutes to
+        tens of minutes — so waiting for it before booking would pin capital
+        against the open-exposure cap and stop the bot trading. Instead a
+        window settles provisionally on spot, and this is what the reconciler
+        walks to replace those verdicts with the venue's.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, mode, slug, side, shares, stake_usd, payout_usd, "
+                "pnl_usd, won FROM settlements "
+                "WHERE method='spot' AND settled_at >= ? ORDER BY settled_at",
+                (since,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def apply_venue_outcome(
+        self, settlement_id: int, won: int, payout_usd: float, pnl_usd: float
+    ) -> None:
+        """Replace a provisional verdict with the one the venue published."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE settlements SET won=?, payout_usd=?, pnl_usd=?, "
+                "method='venue', anchor_source='venue' WHERE id=?",
+                (int(won), float(payout_usd), float(pnl_usd), int(settlement_id)),
+            )
+            self._conn.commit()
 
     def log(
         self,
@@ -288,11 +398,57 @@ class Store:
 
     # -- reads -------------------------------------------------------------
 
-    def open_positions(self, mode: str) -> list[dict[str, Any]]:
+    @staticmethod
+    def _strategy_clause(strategy: str | None) -> tuple[str, list[Any]]:
+        """SQL fragment and params for an optional strategy filter.
+
+        ``None`` deliberately means every strategy rather than the default one,
+        so that callers written before the column existed keep seeing complete
+        history.
+        """
+        if not strategy or strategy == "all":
+            return "", []
+        return " AND strategy=?", [strategy]
+
+    def strategies_seen(self, mode: str) -> list[dict[str, Any]]:
+        """Strategies that have written rows in this mode, for the UI selector.
+
+        Sourced from both tables so a strategy that has opened positions but
+        not yet settled anything still appears — otherwise it would be missing
+        from the selector for exactly as long as it takes to prove itself.
+        """
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM positions WHERE mode=? AND status='open' ORDER BY opened_at DESC",
-                (mode,),
+                "SELECT strategy, SUM(settlements) AS settlements, "
+                "       SUM(open_positions) AS open_positions "
+                "FROM ("
+                "  SELECT strategy, COUNT(*) AS settlements, 0 AS open_positions "
+                "  FROM settlements WHERE mode=? GROUP BY strategy"
+                "  UNION ALL"
+                "  SELECT strategy, 0 AS settlements, COUNT(*) AS open_positions "
+                "  FROM positions WHERE mode=? AND status='open' GROUP BY strategy"
+                ") GROUP BY strategy ORDER BY settlements DESC, strategy ASC",
+                (mode, mode),
+            ).fetchall()
+        return [
+            {
+                "strategy": r["strategy"],
+                "settlements": int(r["settlements"] or 0),
+                "open_positions": int(r["open_positions"] or 0),
+            }
+            for r in rows
+        ]
+
+    def open_positions(
+        self, mode: str, strategy: str | None = None
+    ) -> list[dict[str, Any]]:
+        clause, extra = self._strategy_clause(strategy)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM positions WHERE mode=? AND status='open'"
+                + clause
+                + " ORDER BY opened_at DESC",
+                [mode, *extra],
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -360,23 +516,27 @@ class Store:
             ).fetchone()
         return float(row["s"] or 0.0)
 
-    def open_exposure(self, mode: str) -> float:
+    def open_exposure(self, mode: str, strategy: str | None = None) -> float:
         """Total capital currently committed across every open position."""
+        clause, extra = self._strategy_clause(strategy)
         with self._lock:
             row = self._conn.execute(
                 "SELECT COALESCE(SUM(stake_usd),0) AS s FROM positions "
-                "WHERE mode=? AND status='open'",
-                (mode,),
+                "WHERE mode=? AND status='open'" + clause,
+                [mode, *extra],
             ).fetchone()
         return float(row["s"] or 0.0)
 
-    def exposure_since(self, mode: str, since: float) -> float:
+    def exposure_since(
+        self, mode: str, since: float, strategy: str | None = None
+    ) -> float:
         """Total staked since a timestamp, open or settled — the daily cap basis."""
+        clause, extra = self._strategy_clause(strategy)
         with self._lock:
             row = self._conn.execute(
                 "SELECT COALESCE(SUM(stake_usd),0) AS s FROM positions "
-                "WHERE mode=? AND opened_at >= ?",
-                (mode, since),
+                "WHERE mode=? AND opened_at >= ?" + clause,
+                [mode, since, *extra],
             ).fetchone()
         return float(row["s"] or 0.0)
 
@@ -385,12 +545,16 @@ class Store:
         mode: str,
         limit: int = 500,
         since: float | None = None,
+        strategy: str | None = None,
     ) -> list[dict[str, Any]]:
         query = "SELECT * FROM settlements WHERE mode=?"
         params: list[Any] = [mode]
         if since is not None:
             query += " AND settled_at>=?"
             params.append(since)
+        clause, extra = self._strategy_clause(strategy)
+        query += clause
+        params.extend(extra)
         query += " ORDER BY settled_at DESC LIMIT ?"
         params.append(limit)
         with self._lock:
@@ -401,6 +565,7 @@ class Store:
         self,
         mode: str,
         since: float | None = None,
+        strategy: str | None = None,
     ) -> dict[str, Any]:
         """Complete outcome summary for one display range.
 
@@ -419,6 +584,9 @@ class Store:
         if since is not None:
             query += " AND settled_at>=?"
             params.append(since)
+        clause, extra = self._strategy_clause(strategy)
+        query += clause
+        params.extend(extra)
         with self._lock:
             row = self._conn.execute(query, params).fetchone()
 
@@ -494,19 +662,30 @@ class Store:
         return [float(r["pnl_usd"]) for r in rows]
 
     def equity_curve(
-        self, mode: str, since: float | None = None, max_points: int = 5000
+        self,
+        mode: str,
+        since: float | None = None,
+        max_points: int = 5000,
+        strategy: str | None = None,
     ) -> list[dict[str, Any]]:
         """Cumulative P/L over time, oldest first, with a bounded wire payload.
 
         SQLite computes the complete running total. When history grows beyond
         ``max_points``, only evenly spaced display samples plus the exact final
         point cross into Python. Aggregate statistics remain unsampled.
+
+        The running total is computed *after* the strategy filter, so switching
+        the selector redraws a curve that starts at zero for that strategy
+        rather than showing its slice of a blended total.
         """
+        clause, extra = self._strategy_clause(strategy)
         query = "SELECT settled_at, pnl_usd FROM settlements WHERE mode=?"
         params: list[Any] = [mode]
         if since is not None:
             query += " AND settled_at >= ?"
             params.append(since)
+        query += clause
+        params.extend(extra)
         query += " ORDER BY settled_at ASC"
         with self._lock:
             count_query = "SELECT COUNT(*) AS n FROM settlements WHERE mode=?"
@@ -514,6 +693,8 @@ class Store:
             if since is not None:
                 count_query += " AND settled_at >= ?"
                 count_params.append(since)
+            count_query += clause
+            count_params.extend(extra)
             total = int(self._conn.execute(count_query, count_params).fetchone()["n"])
 
             if total <= max_points:
@@ -526,6 +707,8 @@ class Store:
                 if since is not None:
                     where += " AND settled_at >= ?"
                     sample_params.append(since)
+                where += clause
+                sample_params.extend(extra)
                 sample_params.append(stride)
                 rows = self._conn.execute(
                     "WITH curve AS ("
@@ -558,12 +741,18 @@ class Store:
                 out.append({"t": float(row["settled_at"]), "v": round(cumulative, 4)})
         return out
 
-    def stats(self, mode: str, since: float | None = None) -> dict[str, Any]:
+    def stats(
+        self,
+        mode: str,
+        since: float | None = None,
+        strategy: str | None = None,
+    ) -> dict[str, Any]:
         """Aggregate settled performance, optionally limited to a time window.
 
         ``since`` scopes only the settlement aggregates. Open positions are
         always counted in full — a position is open now regardless of which
-        chart range happens to be selected.
+        chart range happens to be selected. ``strategy`` scopes both, because
+        an open position does belong to exactly one strategy.
         """
         query = (
             "SELECT COUNT(*) AS n, "
@@ -580,12 +769,16 @@ class Store:
         if since is not None:
             query += " AND settled_at >= ?"
             params.append(since)
+        clause, extra = self._strategy_clause(strategy)
+        query += clause
+        params.extend(extra)
 
         with self._lock:
             row = self._conn.execute(query, params).fetchone()
             open_row = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM positions WHERE mode=? AND status='open'",
-                (mode,),
+                "SELECT COUNT(*) AS n FROM positions WHERE mode=? AND status='open'"
+                + clause,
+                [mode, *extra],
             ).fetchone()
 
         n = int(row["n"] or 0)
@@ -607,7 +800,12 @@ class Store:
             "last_at": float(row["last_at"]) if row["last_at"] else None,
         }
 
-    def by_asset(self, mode: str, since: float | None = None) -> list[dict[str, Any]]:
+    def by_asset(
+        self,
+        mode: str,
+        since: float | None = None,
+        strategy: str | None = None,
+    ) -> list[dict[str, Any]]:
         query = (
             "SELECT asset, window, COUNT(*) AS n, COALESCE(SUM(won),0) AS wins, "
             "       COALESCE(SUM(pnl_usd),0) AS pnl, COALESCE(SUM(stake_usd),0) AS staked "
@@ -617,6 +815,9 @@ class Store:
         if since is not None:
             query += " AND settled_at>=?"
             params.append(since)
+        clause, extra = self._strategy_clause(strategy)
+        query += clause
+        params.extend(extra)
         query += " GROUP BY asset, window ORDER BY pnl DESC"
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
@@ -645,9 +846,20 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def reset(self, mode: str) -> None:
-        """Wipe all rows for one mode. Used by the dashboard's reset control."""
+    def reset(self, mode: str, strategy: str | None = None) -> None:
+        """Wipe rows for one mode, optionally for a single strategy.
+
+        Scoping to a strategy lets a paper cohort be restarted without
+        discarding the other strategy's comparison history. The activity log is
+        only cleared on a full-mode reset, because its rows are not attributed
+        to a strategy and a partial wipe would leave a misleading trail.
+        """
+        clause, extra = self._strategy_clause(strategy)
         with self._lock:
-            for table in ("positions", "settlements", "activity"):
-                self._conn.execute(f"DELETE FROM {table} WHERE mode=?", (mode,))
+            for table in ("positions", "settlements"):
+                self._conn.execute(
+                    f"DELETE FROM {table} WHERE mode=?" + clause, [mode, *extra]
+                )
+            if not clause:
+                self._conn.execute("DELETE FROM activity WHERE mode=?", (mode,))
             self._conn.commit()

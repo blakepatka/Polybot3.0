@@ -27,17 +27,39 @@ from typing import Any
 from .broker import LiveBroker, LiveTradingDisabled, PaperBroker
 from .feeds import PolymarketFeed, SpotFeed
 from .feeds.chainlink import ChainlinkStreams
-from .feeds.polymarket import MarketWindow
-from .maker import MakerStrategy, Quote
+from .feeds.polymarket import WINDOW_SECONDS, MarketWindow
+from .feeds.spot import EXCHANGE, RESOLUTION
 from .risk import RiskManager
 from .settings import ASSET_SPEC, Runtime, live_trading_enabled
-from .signal import SignalModel
 from .store import Store
+from .strategy import AntsaslykuStrategy
 
 # Wait this long after a window closes before settling, so a spot tick landing
 # just after the boundary is included rather than raced.
 SETTLE_GRACE_SECONDS = 3.0
 SIGNAL_RETENTION_SECONDS = 24 * 60 * 60
+# The venue publishes an outcome long after the window closes — measured on
+# 2026-08-15, a window 186s old was still unresolved while everything beyond
+# ~43min had resolved. Waiting for it before booking would pin every position
+# against the open-exposure cap for the better part of an hour and stop the bot
+# trading, so a window settles provisionally on the spot proxy and the
+# reconciler below replaces that verdict once the venue answers.
+#
+# How far back the reconciler looks. Comfortably beyond observed publish
+# latency, so a slow resolution is still caught.
+SETTLEMENT_RECONCILE_LOOKBACK_SECONDS = 6 * 60 * 60
+# How often it sweeps. The venue answers in minutes, not seconds; polling
+# faster only spends API calls on windows that cannot have resolved yet.
+SETTLEMENT_RECONCILE_INTERVAL_SECONDS = 300.0
+# When to give up on a window no price series covers and the venue never
+# resolved. Deliberately long: abandoning writes no settlement row, so the
+# stake vanishes from the ledger entirely rather than being booked as a loss.
+# Well past observed venue latency, so this should effectively never fire.
+UNRESOLVED_ABANDON_SECONDS = 6 * 60 * 60
+# How long an operator's manual daily-loss bypass holds. The stop itself still
+# measures P/L across the UTC day, so when this elapses it re-engages against
+# the same losing day unless P/L has recovered above the limit in the meantime.
+DAILY_LOSS_BYPASS_SECONDS = 60 * 60
 
 
 @dataclass
@@ -72,27 +94,22 @@ class Engine:
         # settlement source, because it is the same stream the venue resolves
         # on — removing the exchange-vs-Chainlink basis entirely.
         self.chainlink = ChainlinkStreams(assets)
-        self.model = SignalModel(config)
         self.risk = RiskManager(config)
         self.paper = PaperBroker(config)
         self.live = LiveBroker(config)
 
-        self.strategy = config.get("strategy", "maker")
-        self.max_entries_per_window = int(config["entry"]["max_entries_per_window"])
-        self.maker = MakerStrategy(config)
-        self.maker_stats = {
-            "quotes_placed": 0,
-            "fills": 0,
-            "locked_windows": 0,
-            "requotes": 0,
-            "rebates_usd": 0.0,
-        }
+        # There is exactly one strategy in this project: the @antsaslyku
+        # replication. Paper and Live run the same module against the same
+        # feeds, so Paper is a true rehearsal rather than a different bot.
+        self.antsaslyku = AntsaslykuStrategy(config)
+        self.strategy = self.antsaslyku.NAME
         self.stats = EngineStats()
         self.latest_signals: dict[str, dict[str, Any]] = {}
-        # Explicit operator override for the current UTC day. This is kept
-        # paper-only and in memory so it can never weaken Live or survive into
-        # a later day/restart by accident.
-        self.paper_daily_loss_bypass_until: float = 0.0
+        # Explicit operator override of the daily-loss stop, applying to Paper
+        # and Live alike. Held in memory only, so it can never survive a
+        # restart and leave an unattended box trading past its loss limit.
+        self.daily_loss_bypass_until: float = 0.0
+        self.daily_loss_bypass_scope: str = "hour"
         # Populated by the final Live-order preflight.  Keeping the last
         # wallet snapshot visible in /api/state makes it possible to verify
         # that the configured bankroll is being reconciled with real funds.
@@ -106,9 +123,16 @@ class Engine:
         # Anchor price per window slug, captured once so every position in the
         # same window is judged against an identical opening price.
         self._anchors: dict[str, float] = {}
-        # A one-tick signal change is noise, not a side switch. Candidates must
-        # persist before an opposite-side order becomes eligible.
-        self._reversal_candidates: dict[str, dict[str, Any]] = {}
+        # Which price series each anchor was read from. Settlement takes the
+        # window's close from the same one, so that the difference between
+        # them is a price move rather than the basis between two feeds.
+        self._anchor_sources: dict[str, str] = {}
+        # Outcomes the venue has published, by slug. Fetched once per window
+        # and cached because a resolution never changes once it exists.
+        self._resolutions: dict[str, str] = {}
+        # Last time the venue reconciler ran. Zero so the first loop sweeps
+        # immediately, catching anything a restart settled provisionally.
+        self._last_reconcile: float = 0.0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -229,8 +253,11 @@ class Engine:
                 close_price=None,
                 settled_at=time.time(),
                 method="panic",
+                anchor_source=position["anchor_source"],
+                strategy=position["strategy"],
             )
             self.store.close_position(position["id"], "closed")
+            self._release_window(position["slug"])
             closed += 1
 
         self.store.log(
@@ -260,43 +287,40 @@ class Engine:
                 if live_markets:
                     await self.poly.refresh_books(live_markets)
 
-                # When Data Streams is live its prices become the buffer's
-                # source of truth, so anchors, volatility and settlement all
-                # derive from the exact series the venue resolves on.
+                # Data Streams prices land in their own series inside the
+                # buffer, tagged RESOLUTION. They are emphatically NOT merged
+                # with exchange spot: the two feeds sit a real basis apart —
+                # dollars, on BTC — so a buffer that interleaves them makes
+                # every read a coin flip between two different prices, and any
+                # subtraction across them reports the basis as a price move.
                 if self.chainlink.health.get("active"):
                     for asset, sp in self.chainlink.latest.items():
                         state = self.spot.get(asset)
                         if state is not None:
-                            state.push(sp.price, sp.received_at)
-                            state.sources.add("chainlink")
+                            state.push(sp.price, sp.received_at, RESOLUTION)
+                            state.sources.add(RESOLUTION)
 
-                entry = self.config["entry"]
-                entry_override = bool(
-                    entry.get("confidence_only", False)
-                    or entry.get("profit_tuned", False)
+                self.risk.update_regimes(self.spot.snapshot())
+                self.risk.update_hourly_loss(
+                    self.store.pnl_since(
+                        self.runtime.mode, now - self.risk.dd_lookback_seconds
+                    ),
+                    now,
                 )
-                if not entry_override:
-                    self.risk.update_regimes(self.spot.snapshot())
-                    self.risk.update_hourly_loss(
-                        self.store.pnl_since(
-                            self.runtime.mode, now - self.risk.dd_lookback_seconds
-                        ),
-                        now,
-                    )
 
                 self._capture_anchors(live_markets, now)
 
-                # Maker fills must be processed before settlement so a fill
-                # landing in the final seconds is still counted in the window
-                # it belongs to.
-                if self.strategy in ("maker", "both") and not self.runtime.paused:
-                    self._run_maker(live_markets, now)
-
                 await self._settle_closed(now)
-                self._settle_maker(now)
 
-                if self.strategy in ("directional", "both") and not self.runtime.paused:
-                    await self._scan(live_markets, now)
+                # Second settlement phase, on its own clock. Provisional spot
+                # verdicts booked above are replaced by the venue's once it
+                # publishes — see reconcile_settlements.
+                if now - self._last_reconcile >= SETTLEMENT_RECONCILE_INTERVAL_SECONDS:
+                    self._last_reconcile = now
+                    await self.reconcile_settlements(now)
+
+                if not self.runtime.paused:
+                    await self._run_strategy(live_markets, now)
 
                 self.runtime.update(last_error=None)
             except asyncio.CancelledError:
@@ -308,6 +332,24 @@ class Engine:
             self.stats.loops += 1
             await asyncio.sleep(max(0.5, interval - (time.perf_counter() - started)))
 
+    def _anchor_source_of(self, slug: str) -> str | None:
+        """Series a window was anchored on, if this process captured it."""
+        return getattr(self, "_anchor_sources", {}).get(slug)
+
+    def _settlement_source(self, state: Any, start: float) -> str | None:
+        """Which price series decides this window, open and close alike.
+
+        The resolution stream is preferred because it is what the venue
+        actually settles on. Exchange spot is the fallback for windows that
+        opened before the stream connected — its own open is still readable,
+        and a window judged consistently on the predictor feed is far better
+        than one judged on the basis between the two.
+        """
+        for candidate in (RESOLUTION, EXCHANGE):
+            if state.price_at_or_before(start, candidate) is not None:
+                return candidate
+        return None
+
     def _capture_anchors(self, markets: list[MarketWindow], now: float) -> None:
         """Latch each window's opening price the first time we can read it."""
         for market in markets:
@@ -316,9 +358,14 @@ class Engine:
             state = self.spot.get(market.asset)
             if state is None:
                 continue
-            anchor = state.price_at_or_before(market.start)
+            source = self._settlement_source(state, market.start)
+            if source is None:
+                continue
+            anchor = state.price_at_or_before(market.start, source)
             if anchor:
                 self._anchors[market.slug] = anchor
+                # Settlement must read the close from this same series.
+                self._anchor_sources[market.slug] = source
 
     def _remember_signal(self, signal: Any, now: float) -> None:
         """Keep the most recent score for a window for no longer than 24 hours."""
@@ -372,217 +419,20 @@ class Engine:
                 stale.append(slug)
         for slug in stale:
             self._anchors.pop(slug, None)
-            self._reversal_candidates.pop(slug, None)
+            self._anchor_sources.pop(slug, None)
+            self._resolutions.pop(slug, None)
 
-    # -- maker -------------------------------------------------------------
-
-    def _run_maker(self, markets: list[MarketWindow], now: float) -> None:
-        """One pass of the two-sided quoting loop.
-
-        Order matters: check existing quotes for fills first, then flatten any
-        residual exposure, then place fresh quotes. Flattening takes priority
-        over new pairs because unpaired inventory is the only real risk the
-        strategy carries.
-        """
-        mode = self.runtime.mode
-        runtime = self.runtime.snapshot()
-        day_exposure = self.store.exposure_since(mode, _start_of_day(now))
-        selection = self.live_market_selection()
-
-        max_drift = float(self.config["maker"]["max_quote_drift_cents"])
-
-        for market in markets:
-            if (
-                not self.configured_market_allowed(market.asset, market.window)
-                or not self.live_market_allowed(market.asset, market.window, selection)
-            ):
-                self.maker.quotes.pop((market.slug, "up"), None)
-                self.maker.quotes.pop((market.slug, "down"), None)
-                continue
-
-            # -- cancel quotes that mid has drifted away from, before checking
-            # fills. A stale quote is a free option written to the market.
-            for side in self.maker.stale_quotes(market, max_drift):
-                self.maker.quotes.pop((market.slug, side), None)
-                self.maker_stats["requotes"] += 1
-
-            # -- fills on resting quotes
-            for side in ("up", "down"):
-                key = (market.slug, side)
-                quote = self.maker.quotes.get(key)
-                if quote is None:
-                    continue
-                fill = self.maker.simulate_fill(quote, market)
-                if fill is None:
-                    continue
-
-                self.maker.quotes.pop(key, None)
-                # Resting fills earn the maker fee-share rebate, which offsets
-                # a little of the cost. Credited against cost basis so it shows
-                # up in P/L rather than as a separate flattering line item.
-                rebate = self.maker.maker_rebate(fill["price"], fill["shares"], market)
-                inv = self.maker.record_fill(
-                    market, side, fill["shares"], fill["cost"] - rebate
-                )
-                self.maker_stats["fills"] += 1
-                self.maker_stats["rebates_usd"] += rebate
-                day_exposure += fill["cost"]
-
-                self.store.log(
-                    mode, "fill",
-                    f"{market.asset.upper()} {market.window} {side.upper()} filled "
-                    f"{fill['shares']:.1f} @ {fill['price'] * 100:.0f}¢ · ${fill['cost']:.2f}",
-                    asset=market.asset, slug=market.slug,
-                    detail=(f"pair cost {inv.pair_cost * 100:.0f}¢ · "
-                            f"locked {inv.locked_shares:.1f} shares "
-                            f"(${inv.locked_profit:.2f})") if inv.locked_shares else "unpaired leg",
-                )
-
-            if self.runtime.paused:
-                continue
-
-            # -- risk gates apply to the whole strategy, not each leg
-            if self.risk.breaker_active or self.risk.asset_halted(market.asset):
-                continue
-            if day_exposure >= runtime["daily_cap_usd"]:
-                self.stats.reject("Daily cap reached")
-                continue
-
-            inv = self.maker.inventory.get(market.slug)
-            window_cost = inv.total_cost if inv else 0.0
-            market_window_cap = float(
-                self.config["entry"].get(
-                    "hard_market_window_cap_usd",
-                    runtime["max_per_window_usd"],
-                )
-            )
-            market_window_remaining = max(0.0, market_window_cap - window_cost)
-            if market_window_remaining < self.risk.min_trade_usd:
-                self.stats.reject("Per-market/window cap reached")
-                continue
-
-            # -- flatten residual exposure first (active side switching)
-            residual = self.maker.residual_quote(market, now)
-            if residual is not None:
-                residual.size_usd = min(
-                    residual.size_usd,
-                    runtime["max_per_trade_usd"],
-                    market_window_remaining,
-                )
-                bankroll_size, bankroll_reason = self._apply_bankroll_cap(
-                    mode, residual.size_usd, now
-                )
-                if bankroll_size is None:
-                    self.stats.reject(bankroll_reason or "bankroll cap")
-                    continue
-                residual.size_usd = bankroll_size
-                self.maker.quotes[(market.slug, residual.side)] = residual
-                self.maker_stats["quotes_placed"] += 1
-                continue
-
-            # -- otherwise quote both sides for a fresh pair
-            if any((market.slug, s) in self.maker.quotes for s in ("up", "down")):
-                continue
-
-            state = self.spot.get(market.asset)
-            p_up = None
-            if state is not None:
-                signal = self.model.evaluate(market, state, now)
-                if signal is not None:
-                    p_up = signal.raw_probability
-                    self._remember_signal(signal, now)
-            self.stats.signal_scans += 1
-
-            desired = self.maker.desired_quotes(market, p_up, now)
-            for quote in desired:
-                quote.size_usd = min(quote.size_usd, runtime["max_per_trade_usd"])
-            requested_pair = sum(quote.size_usd for quote in desired)
-            if requested_pair:
-                if requested_pair > market_window_remaining + 1e-6:
-                    self.stats.reject("Per-market/window room below pair size")
-                    continue
-                bankroll_size, bankroll_reason = self._apply_bankroll_cap(
-                    mode, requested_pair, now
-                )
-                # Both legs must fit. Quoting only one side would convert a
-                # bankroll resize into an unintended directional position.
-                if bankroll_size is None or bankroll_size + 1e-6 < requested_pair:
-                    self.stats.reject(bankroll_reason or "bankroll room below pair size")
-                    continue
-            for quote in desired:
-                self.maker.quotes[(market.slug, quote.side)] = quote
-                self.maker_stats["quotes_placed"] += 1
-
-    def _settle_maker(self, now: float) -> None:
-        """Resolve maker inventory for windows that have closed."""
-        mode = self.runtime.mode
-        for slug in [s for s, inv in self.maker.inventory.items()
-                     if now >= inv.end + SETTLE_GRACE_SECONDS]:
-            inv = self.maker.inventory[slug]
-            state = self.spot.get(inv.asset)
-            anchor = self._anchors.get(slug)
-            close = state.price_at_or_before(inv.end) if state else None
-
-            if close is None or not anchor:
-                if now > inv.end + 300:
-                    self.maker.drop_window(slug)
-                    self.store.log(
-                        mode, "warn",
-                        f"{inv.asset.upper()} {inv.window} maker inventory dropped — "
-                        "no spot price covering the window close.",
-                        asset=inv.asset, slug=slug,
-                    )
-                continue
-
-            up_won = close >= anchor
-            result = inv.settle(up_won)
-            side_label = "up" if up_won else "down"
-
-            self.store.record_settlement(
-                position_id=None,
-                mode=mode,
-                slug=slug,
-                asset=inv.asset,
-                window=inv.window,
-                side=side_label,
-                confidence=None,
-                entry_price=round(inv.total_cost / max(inv.shares_up + inv.shares_down, 1e-9), 4),
-                shares=round(inv.shares_up + inv.shares_down, 4),
-                stake_usd=result["cost_usd"],
-                payout_usd=result["payout_usd"],
-                pnl_usd=result["pnl_usd"],
-                won=1 if result["pnl_usd"] >= 0 else 0,
-                anchor_price=anchor,
-                close_price=close,
-                settled_at=now,
-                method="maker",
-            )
-            if inv.locked_shares > 0:
-                self.maker_stats["locked_windows"] += 1
-
-            self.store.log(
-                mode, "settlement",
-                f"{inv.asset.upper()} {inv.window} maker {result['pnl_usd']:+.2f} "
-                f"({inv.locked_shares:.1f} locked pairs @ {inv.pair_cost * 100:.0f}¢)",
-                asset=inv.asset, slug=slug,
-                detail=(f"anchor {anchor:.6g} → close {close:.6g} · {side_label.upper()} won · "
-                        f"residual {result['residual_shares']:.1f} "
-                        f"{result['residual_side'] or 'none'}"),
-            )
-            self.maker.drop_window(slug)
-
-    # -- entries -----------------------------------------------------------
+    # -- market eligibility -------------------------------------------------
 
     def configured_market_allowed(self, asset: str, window: str) -> bool:
-        """Return false for a disabled or currently unqualified cohort."""
+        """Return false for a cohort the operator has switched off."""
         return self.configured_market_rejection(asset, window) is None
 
     def configured_market_rejection(self, asset: str, window: str) -> str | None:
-        """Explain the static or rolling-evidence gate blocking a cohort.
+        """Explain the operator exclusion blocking a cohort, if any.
 
-        This gate is deliberately separate from the paper-tested live
-        whitelist. Entry override modes may bypass that whitelist, but they
-        must never bypass an explicit market exclusion.
+        This is the one gate nothing may bypass. It is deliberately separate
+        from the paper-tested live whitelist below, which is advisory.
         """
         asset = str(asset).lower()
         window = str(window).lower()
@@ -592,40 +442,7 @@ class Engine:
             and str(row.get("window", "")).lower() == window
             for row in self.config.get("excluded_markets", [])
         )
-        if excluded:
-            return "market disabled by operator"
-        if self.config.get("entry", {}).get(
-            "require_evidence_qualified_market", False
-        ):
-            evidence = self.store.cohort_evidence("paper", asset, window)
-            if (
-                not evidence["evidence_qualified"]
-                and not self._paper_experimental_market_allowed(asset, window)
-            ):
-                return "market failed rolling paper evidence gate"
-        return None
-
-    def _paper_experimental_market_allowed(self, asset: str, window: str) -> bool:
-        """Allow an exact unqualified cohort only as a configured Paper test."""
-        if getattr(getattr(self, "runtime", None), "mode", None) != "paper":
-            return False
-        asset = str(asset).lower()
-        window = str(window).lower()
-        entry = self.config.get("entry", {})
-        minimum_floor = max(
-            0.50, float(entry.get("paper_experimental_min_confidence", 0.90))
-        )
-        asset_floor = float(
-            entry.get("asset_min_confidence", {}).get(asset, 0.0)
-        )
-        return any(
-            isinstance(row, dict)
-            and str(row.get("asset", "")).lower() == asset
-            and str(row.get("window", "")).lower() == window
-            and max(asset_floor, float(row.get("min_confidence", 0.0)))
-            >= minimum_floor
-            for row in entry.get("paper_experimental_markets", [])
-        )
+        return "market disabled by operator" if excluded else None
 
     def live_market_selection(self) -> dict[str, Any]:
         """Rank live-eligible markets using settled paper results only."""
@@ -680,15 +497,6 @@ class Engine:
             for row in selection["eligible"]
         )
 
-    def normal_entry_cap(self) -> int:
-        """Leave one measured entry slot available for an opposite-side hedge."""
-        entry = self.config["entry"]
-        reserve = int(
-            bool(entry.get("reversal_enabled", False))
-            and int(entry.get("max_side_switches", 0)) > 0
-        )
-        return max(1, self.max_entries_per_window - reserve)
-
     def _apply_hard_window_cap(
         self,
         mode: str,
@@ -698,11 +506,11 @@ class Engine:
     ) -> tuple[float | None, str | None]:
         """Cap one shared timed interval across every configured asset.
 
-        This is intentionally separate from ``RiskManager`` because entry
-        override modes bypass that layer. Every enabled asset ending in the
-        same timed window consumes the same allowance.
+        Every enabled asset ending in the same timed window consumes the same
+        allowance, so the configured cap is not silently multiplied by the
+        number of assets.
         """
-        cap = float(self.config["entry"].get("hard_window_cap_usd", 0.0))
+        cap = float(self.config["limits"].get("hard_window_cap_usd", 0.0))
         if cap <= 0:
             return float(requested_usd), None
 
@@ -728,11 +536,11 @@ class Engine:
         allowance, while ``_apply_hard_window_cap`` still caps their combined
         exposure for that timed interval.
         """
-        entry = self.config["entry"]
+        limits = self.config["limits"]
         cap = float(
-            entry.get(
+            limits.get(
                 "hard_market_window_cap_usd",
-                entry.get("hard_window_cap_usd", 0.0),
+                limits.get("hard_window_cap_usd", 0.0),
             )
         )
         if cap <= 0:
@@ -748,21 +556,22 @@ class Engine:
             )
         return size, None
 
-    def _actual_open_exposure(self, mode: str) -> float:
-        exposure = self.store.open_exposure(mode)
-        maker = getattr(self, "maker", None)
-        if maker is not None:
-            exposure += sum(
-                float(inventory.total_cost)
-                for inventory in maker.inventory.values()
-            )
-        return exposure
+    def _actual_open_exposure(self, mode: str, strategy: str | None = None) -> float:
+        """Capital committed to open positions, from the ledger.
 
-    def _pending_quote_exposure(self) -> float:
-        maker = getattr(self, "maker", None)
-        if maker is None:
-            return 0.0
-        return sum(float(quote.size_usd) for quote in maker.quotes.values())
+        Every fill this project makes becomes a positions row, so the ledger is
+        the whole picture — there is no resting-quote inventory to add.
+        """
+        return self.store.open_exposure(mode, strategy)
+
+    def _bankroll_scope(self, mode: str, strategy: str | None) -> str | None:
+        """Whose budget a prospective order is charged against.
+
+        One strategy, one bankroll, in both modes. The parameter is retained so
+        the limit helpers keep a single signature, and so a future second
+        strategy can be given its own Paper allowance without reworking them.
+        """
+        return None if mode == "live" else strategy
 
     def bankroll_status(self, now: float | None = None) -> dict[str, Any]:
         """Current use of the operator-declared bankroll for this mode."""
@@ -776,7 +585,7 @@ class Engine:
         starting_balance = float(cfg.get("starting_balance_usd", 0.0))
         max_open = float(cfg.get("max_open_exposure_usd", 0.0))
         open_exposure = self._actual_open_exposure(mode)
-        pending_quotes = self._pending_quote_exposure()
+        pending_quotes = 0.0
         status: dict[str, Any] = {
             "starting_balance_usd": starting_balance,
             "cash_reserve_usd": round(
@@ -798,10 +607,11 @@ class Engine:
             "max_daily_loss_usd": float(cfg.get("max_daily_loss_usd", 0.0)),
             "daily_profit_lock_usd": float(cfg.get("daily_profit_lock_usd", 0.0)),
             "daily_pnl_usd": round(day_pnl, 4),
-            "paper_daily_loss_bypass_active": self._paper_daily_loss_bypass_active(
-                mode, now
+            "daily_loss_bypass_active": self._daily_loss_bypass_active(now),
+            "daily_loss_bypass_until": self.daily_loss_bypass_until,
+            "daily_loss_bypass_scope": getattr(
+                self, "daily_loss_bypass_scope", "hour"
             ),
-            "paper_daily_loss_bypass_until": self.paper_daily_loss_bypass_until,
             "max_daily_turnover_usd": float(
                 cfg.get("max_daily_turnover_usd", 0.0)
             ),
@@ -817,23 +627,31 @@ class Engine:
         mode: str,
         requested_usd: float,
         now: float,
+        strategy: str | None = None,
     ) -> tuple[float | None, str | None]:
         """Apply capital, turnover and loss limits that overrides cannot skip."""
         cfg = self.config.get("bankroll", {})
         if not cfg:
             return float(requested_usd), None
 
+        # Live: one shared bankroll. Paper: one budget per strategy, so a
+        # comparison is not decided by loop order. See _bankroll_scope.
+        scope = self._bankroll_scope(mode, strategy)
+
         day_start = max(
             _start_of_day(now), float(cfg.get("activated_at", 0.0))
         )
         bankroll = float(cfg.get("starting_balance_usd", 0.0))
+        # Deliberately not prefixed with the scope: each strategy's rejections
+        # are already recorded against its own stats object, and operator-facing
+        # reason strings are matched elsewhere.
         bankroll_label = f"${bankroll:,.0f} bankroll" if bankroll > 0 else "bankroll"
         max_daily_loss = float(cfg.get("max_daily_loss_usd", 0.0))
-        daily_pnl = float(self.store.stats(mode, day_start)["total_pnl"])
+        daily_pnl = float(self.store.stats(mode, day_start, scope)["total_pnl"])
         if (
             max_daily_loss > 0
             and daily_pnl <= -max_daily_loss
-            and not self._paper_daily_loss_bypass_active(mode, now)
+            and not self._daily_loss_bypass_active(now)
         ):
             return None, (
                 f"{bankroll_label} daily loss stop reached "
@@ -848,9 +666,7 @@ class Engine:
             )
 
         max_open = float(cfg.get("max_open_exposure_usd", 0.0))
-        open_exposure = (
-            self._actual_open_exposure(mode) + self._pending_quote_exposure()
-        )
+        open_exposure = self._actual_open_exposure(mode, scope)
         open_remaining = (
             max(0.0, max_open - open_exposure)
             if max_open > 0
@@ -858,7 +674,7 @@ class Engine:
         )
 
         max_turnover = float(cfg.get("max_daily_turnover_usd", 0.0))
-        day_turnover = self.store.exposure_since(mode, day_start)
+        day_turnover = self.store.exposure_since(mode, day_start, scope)
         turnover_remaining = (
             max(0.0, max_turnover - day_turnover)
             if max_turnover > 0
@@ -961,9 +777,7 @@ class Engine:
             else equity_risk_budget
         )
 
-        tracked_exposure = (
-            self._actual_open_exposure("live") + self._pending_quote_exposure()
-        )
+        tracked_exposure = self._actual_open_exposure("live")
         # The public wallet value can contain positions opened elsewhere; the
         # local cost basis can be higher than mark value.  Taking the maximum
         # is conservative without double-counting known bot positions.
@@ -1003,387 +817,233 @@ class Engine:
             ), False
         return size, None, False
 
-    def _paper_daily_loss_bypass_active(self, mode: str, now: float) -> bool:
-        return bool(
-            mode == "paper"
-            and now < getattr(self, "paper_daily_loss_bypass_until", 0.0)
-        )
+    def _daily_loss_bypass_active(self, now: float) -> bool:
+        return bool(now < getattr(self, "daily_loss_bypass_until", 0.0))
 
-    def bypass_paper_daily_loss_today(self, now: float | None = None) -> dict[str, Any]:
-        """Ignore only Paper's daily-loss stop until the next UTC boundary."""
+    def bypass_daily_loss_stop(
+        self,
+        now: float | None = None,
+        scope: str = "hour",
+    ) -> dict[str, Any]:
+        """Ignore the daily-loss stop, in Paper or Live alike.
+
+        This is an operator override of a real-money backstop: while it holds,
+        a mode that has already hit ``max_daily_loss_usd`` keeps opening new
+        positions. ``scope="hour"`` re-arms the stop an hour later without
+        anyone present; ``scope="day"`` holds until the next UTC reset, which
+        is the whole of the losing day and cannot expire on its own before it.
+        """
+        if scope not in {"hour", "day"}:
+            raise ValueError("scope must be 'hour' or 'day'")
         now = time.time() if now is None else now
-        until = _start_of_day(now) + 86400.0
-        self.paper_daily_loss_bypass_until = until
+        until = (
+            _start_of_day(now) + 86400.0
+            if scope == "day"
+            else now + DAILY_LOSS_BYPASS_SECONDS
+        )
+        self.daily_loss_bypass_until = until
+        self.daily_loss_bypass_scope = scope
+        mode = self.runtime.mode
+        window = (
+            "the rest of the UTC day"
+            if scope == "day"
+            else f"{DAILY_LOSS_BYPASS_SECONDS / 60:.0f} minutes"
+        )
         self.store.log(
-            "paper",
+            mode,
             "risk",
-            "Paper daily-loss stop bypassed until the next UTC reset. Live remains protected.",
+            f"{mode.upper()} daily-loss stop bypassed for {window}.",
         )
         return {
             "ok": True,
-            "mode": "paper",
+            "mode": mode,
             "daily_loss_bypass_active": True,
             "daily_loss_bypass_until": until,
+            "daily_loss_bypass_scope": scope,
         }
 
-    async def _scan(self, markets: list[MarketWindow], now: float) -> None:
+    # -- strategy selection -------------------------------------------------
+
+    def configured_strategies(self) -> list[str]:
+        """Strategies this process can run.
+
+        There is exactly one. The list survives because the dashboard, the
+        store's ``strategy`` discriminator and the settlement path all key off
+        strategy names, and keeping the shape means a second strategy can be
+        added later without a schema change or a UI rewrite.
+        """
+        return [self.antsaslyku.NAME]
+
+    @property
+    def selected_strategy(self) -> str | None:
+        return self.antsaslyku.NAME
+
+    def select_strategy(self, name: str) -> dict[str, Any]:
+        if name != self.antsaslyku.NAME:
+            return {
+                "ok": False,
+                "error": f"'{name}' is not configured to run. "
+                         f"Available: {self.configured_strategies()}",
+            }
+        return {
+            "ok": True,
+            "selected_strategy": name,
+            "available": self.configured_strategies(),
+        }
+
+    def strategy_active(self, name: str, mode: str | None = None) -> bool:
+        """Whether ``name`` may open new positions right now."""
+        return name == self.antsaslyku.NAME
+
+    def strategy_status(self) -> dict[str, Any]:
+        return {
+            "mode": self.runtime.mode,
+            "configured": self.configured_strategies(),
+            "selected": self.selected_strategy,
+            "active": self.configured_strategies(),
+            # One strategy, so the dashboard segment is a label rather than a
+            # switch, in Paper and Live alike.
+            "exclusive": False,
+            "primary": self.strategy,
+        }
+
+    # -- entries -----------------------------------------------------------
+
+    async def _run_strategy(self, markets: list[MarketWindow], now: float) -> None:
+        """One pass of the @antsaslyku replication.
+
+        Deliberately thin. The strategy decides *what* to buy; this method only
+        applies the operator's mandatory bankroll controls and routes the
+        order. Every hard limit an override cannot skip is re-applied inside
+        :meth:`_execute_buy` on the live path, so the strategy cannot trade past
+        the declared bankroll no matter what its own config block says.
+        """
+        strat = self.antsaslyku
         mode = self.runtime.mode
-        runtime = self.runtime.snapshot()
-        entry = self.config["entry"]
-        entry_override = bool(
-            entry.get("confidence_only", False)
-            or entry.get("profit_tuned", False)
-        )
-        day_start = _start_of_day(now)
-        day_exposure = self.store.exposure_since(mode, day_start)
-        realized = self.store.stats(mode)["total_pnl"]
-        selection = self.live_market_selection()
+        strat.prune(now)
 
         for market in markets:
-            market_rejection = self.configured_market_rejection(
-                market.asset, market.window
-            )
-            if market_rejection is not None:
-                self.stats.reject(market_rejection)
+            # Operator market exclusions outrank the strategy.
+            if self.configured_market_rejection(market.asset, market.window) is not None:
+                continue
+            if not self.live_market_allowed(market.asset, market.window):
                 continue
 
             state = self.spot.get(market.asset)
             if state is None:
                 continue
 
-            self.stats.signal_scans += 1
-            signal = self.model.evaluate(market, state, now)
-            if signal is None:
+            intent = strat.evaluate(market, state, now)
+            if intent is None:
+                continue
+            self._remember_signal(intent, now)
+            if not intent.tradeable:
+                self.stats.reject(intent.reason or "unknown")
                 continue
 
-            self._remember_signal(signal, now)
-
-            hard_entry_price = float(entry.get("max_entry_price", 1.0))
-            if signal.entry_price > hard_entry_price:
-                self.stats.reject(
-                    f"entry {signal.entry_price:.2f} above "
-                    f"{hard_entry_price:.2f} hard price ceiling"
+            if strat.dry_run:
+                # Score and log without touching a broker. This is how a
+                # parameter change is meant to be forward-tested before it is
+                # allowed to reach real money.
+                self.store.log(
+                    mode, "strategy",
+                    f"[dry-run] {intent.stage} {intent.side} {market.slug} "
+                    f"${intent.size_usd:.2f} @ {intent.limit_price:.2f} "
+                    f"conf {intent.confidence:.0%}",
+                    asset=market.asset, slug=market.slug,
+                )
+                strat.record_fill(
+                    market.slug, intent.side, intent.size_usd,
+                    intent.size_usd / max(intent.limit_price, 1e-6),
+                    intent.stage, now,
                 )
                 continue
 
-            if not signal.tradeable:
-                self.stats.reject(signal.reason or "unknown")
-                continue
-
-            if (
-                not entry_override
-                and not self.live_market_allowed(market.asset, market.window, selection)
-            ):
-                self.stats.reject("outside paper-tested live whitelist")
-                continue
-
-            # Entry cap per window. This is the single highest-impact rule in
-            # the whole strategy, and it is measured rather than guessed:
-            # replaying 597 real windows from a live profile's own fills, an
-            # uncapped run returned -0.70% while capping at 3 returned +9.12%
-            # on the same trades. Uncapped trading is averaging down into
-            # losers — their 16+-entry windows won 28.8% and lost 12.9%.
-            taken: int | None = None
-            side_switches = 0
-            existing = (
-                self.store.open_position_for(mode, market.slug)
-                if entry.get("reversal_enabled", False)
-                else None
+            size_usd, reason = self._apply_market_window_cap(
+                mode, market.slug, intent.size_usd
             )
-            if existing is not None and existing["side"] != signal.side:
-                taken = self.store.entries_for_window(mode, market.slug)
-                side_switches = self.store.side_switches_for_window(mode, market.slug)
-                if taken >= self.max_entries_per_window:
-                    self.stats.reject(
-                        f"window entry cap ({self.max_entries_per_window})"
-                    )
-                    continue
-                # Every strategy profile routes an opposite-side signal through
-                # the confirmed switch gate. An override must not turn a model
-                # flip into an untracked, uncapped second direction.
-                await self._maybe_reverse(
-                    market, signal, existing, side_switches, now
+            if size_usd is None:
+                self.stats.reject(reason or "hard market-window cap")
+                continue
+            size_usd, reason = self._apply_hard_window_cap(
+                mode, market.window, market.end, size_usd
+            )
+            if size_usd is None:
+                self.stats.reject(reason or "hard shared-window cap")
+                continue
+            size_usd, reason = self._apply_bankroll_cap(
+                mode, size_usd, now, strat.NAME
+            )
+            if size_usd is None:
+                self.stats.reject(reason or "bankroll cap")
+                continue
+
+            decision = self.risk.check_entry(
+                asset=market.asset,
+                stake_usd=size_usd,
+                window_exposure_usd=self.store.interval_exposure(
+                    mode, market.window, market.end
+                ),
+                day_exposure_usd=self.store.exposure_since(mode, _start_of_day(now)),
+                realized_pnl=self.store.stats(mode)["total_pnl"],
+                max_per_trade=self.runtime.max_per_trade_usd,
+                max_per_window=self.runtime.max_per_window_usd,
+                daily_cap=self.runtime.daily_cap_usd,
+                ask_depth_usd=intent.ask_depth_usd,
+                now=now,
+            )
+            if not decision.allowed:
+                self.stats.reject(decision.reason or "risk")
+                self.runtime.update(
+                    halt_reason=decision.reason if self.risk.breaker_active else None
                 )
                 continue
-
-            getattr(self, "_reversal_candidates", {}).pop(market.slug, None)
-
-            if not entry_override:
-                if taken is None:
-                    taken = self.store.entries_for_window(mode, market.slug)
-                side_switches = self.store.side_switches_for_window(mode, market.slug)
-                normal_cap = self.normal_entry_cap()
-                if taken >= normal_cap:
-                    self.stats.reject(
-                        f"normal entry cap ({normal_cap}); reversal slot reserved"
-                    )
-                    continue
-
-            stake = self.risk.size_for(signal.confidence, runtime["max_per_trade_usd"])
-            market_capped_stake, market_cap_reason = self._apply_market_window_cap(
-                mode, market.slug, stake
-            )
-            if market_capped_stake is None:
-                self.stats.reject(market_cap_reason or "hard market-window cap")
-                continue
-            stake = market_capped_stake
-            capped_stake, hard_cap_reason = self._apply_hard_window_cap(
-                mode, market.window, market.end, stake
-            )
-            if capped_stake is None:
-                self.stats.reject(hard_cap_reason or "hard market-window cap")
-                continue
-            stake = capped_stake
-            bankroll_stake, bankroll_reason = self._apply_bankroll_cap(
-                mode, stake, now
-            )
-            if bankroll_stake is None:
-                self.stats.reject(bankroll_reason or "bankroll cap")
-                continue
-            stake = bankroll_stake
-            if entry_override:
-                # The clip remains an order-size setting. Every bot-level
-                # rejection in RiskManager is deliberately bypassed.
-                size_usd = stake
-            else:
-                decision = self.risk.check_entry(
-                    asset=market.asset,
-                    stake_usd=stake,
-                    window_exposure_usd=self.store.interval_exposure(
-                        mode, market.window, market.end
-                    ),
-                    day_exposure_usd=day_exposure,
-                    realized_pnl=realized,
-                    max_per_trade=runtime["max_per_trade_usd"],
-                    max_per_window=runtime["max_per_window_usd"],
-                    daily_cap=runtime["daily_cap_usd"],
-                    ask_depth_usd=signal.ask_depth_usd,
-                    now=now,
-                )
-                if not decision.allowed:
-                    self.stats.reject(decision.reason or "risk")
-                    self.runtime.update(
-                        halt_reason=decision.reason if self.risk.breaker_active else None
-                    )
-                    continue
-                size_usd = decision.size_usd
 
             fill = await self._execute_buy(
-                market, signal.side, size_usd, signal.entry_price
+                market, intent.side, decision.size_usd, intent.limit_price
             )
             if fill is None:
                 self.stats.reject("unfillable at size")
                 continue
 
-            anchor = self._anchors.get(market.slug) or signal.anchor_price
+            strat.record_fill(
+                market.slug, intent.side, fill.stake_usd, fill.shares,
+                intent.stage, now,
+            )
+            self.risk.record_entry(now)
+            self.stats.entries += 1
+
             self.store.open_position(
+                anchor_source=self._anchor_source_of(market.slug),
                 mode=mode,
                 slug=market.slug,
                 asset=market.asset,
                 window=market.window,
-                side=signal.side,
-                confidence=signal.confidence,
+                side=intent.side,
+                confidence=intent.confidence,
                 entry_price=fill.avg_price,
                 shares=fill.shares,
                 stake_usd=fill.stake_usd,
-                anchor_price=anchor,
+                anchor_price=self._anchors.get(market.slug),
                 opened_at=fill.ts,
                 window_end=market.end,
-                switches=(side_switches if not entry_override else 0),
-                order_id=None,
+                switches=0,
+                order_id=getattr(fill, "order_id", None),
                 question=market.question,
+                strategy=strat.NAME,
             )
-            if not entry_override:
-                self.risk.record_entry(now)
-            self.stats.entries += 1
-            day_exposure += fill.stake_usd
-
             self.store.log(
                 mode, "entry",
-                f"{market.asset.upper()} {market.window} {signal.side.upper()} "
-                f"{signal.confidence:.0%} @ {fill.avg_price:.2f} · "
+                f"{market.asset.upper()} {market.window} {intent.side.upper()} "
+                f"{intent.stage} {intent.confidence:.0%} @ {fill.avg_price:.2f} · "
                 f"${fill.stake_usd:.2f} staked",
                 asset=market.asset, slug=market.slug,
                 detail=(
-                    f"expected ROI {signal.expected_roi:.1%}, "
-                    f"fee ${fill.fee_usd:.4f}, {signal.seconds_remaining:.0f}s left"
+                    f"edge {intent.edge:+.3f}, fill #{intent.fill_index + 1}, "
+                    f"fee ${fill.fee_usd:.4f}, "
+                    f"{intent.seconds_into_window:.0f}s into the window"
                 ),
             )
-
-    async def _maybe_reverse(
-        self,
-        market: MarketWindow,
-        signal: Any,
-        position: dict[str, Any],
-        side_switches: int,
-        now: float,
-    ) -> None:
-        """Buy one capped opposite-side leg after a persistent model flip.
-
-        This does not pretend that crossing both asks locks a profit: after the
-        spread and taker fees it usually locks a loss. The new direction instead
-        receives a normal confidence-sized clip. Confirmation and the switch cap
-        keep transient chop from repeatedly adding opposite exposure.
-        """
-        entry = self.config["entry"]
-        if not entry.get("reversal_enabled", False):
-            return
-        if (
-            self.runtime.mode == "live"
-            and not entry.get("reversal_live_enabled", False)
-        ):
-            self.stats.reject("reversal awaiting Paper evidence for Live")
-            return
-        if signal.side == position["side"]:
-            return
-        hard_entry_price = float(entry.get("max_entry_price", 1.0))
-        if signal.entry_price > hard_entry_price:
-            self.stats.reject(
-                f"entry {signal.entry_price:.2f} above "
-                f"{hard_entry_price:.2f} hard price ceiling"
-            )
-            return
-        if int(side_switches) >= int(entry.get("max_side_switches", 0)):
-            self.stats.reject("side-switch cap reached")
-            return
-        if signal.confidence < float(entry.get("reversal_min_confidence", 1.0)):
-            self.stats.reject("reversal confidence below threshold")
-            return
-        if signal.expected_roi < float(entry.get("reversal_min_expected_roi", 0.0)):
-            self.stats.reject("reversal expected ROI below threshold")
-            return
-        if not self._reversal_confirmed(market.slug, signal.side, now):
-            self.stats.reject("reversal awaiting confirmation")
-            return
-
-        runtime = self.runtime.snapshot()
-        # A normal confidence-sized clip changes direction without pretending
-        # that crossing both asks created a risk-free equal-share hedge.
-        target = self.risk.size_for(
-            signal.confidence, runtime["max_per_trade_usd"]
-        )
-        if target < self.risk.min_trade_usd:
-            return
-
-        market_capped_target, market_cap_reason = self._apply_market_window_cap(
-            self.runtime.mode, market.slug, target
-        )
-        if market_capped_target is None:
-            self.stats.reject(market_cap_reason or "hard market-window cap")
-            return
-        target = market_capped_target
-
-        capped_target, hard_cap_reason = self._apply_hard_window_cap(
-            self.runtime.mode, market.window, market.end, target
-        )
-        if capped_target is None:
-            self.stats.reject(hard_cap_reason or "hard market-window cap")
-            return
-        target = capped_target
-
-        bankroll_target, bankroll_reason = self._apply_bankroll_cap(
-            self.runtime.mode, target, now
-        )
-        if bankroll_target is None:
-            self.stats.reject(bankroll_reason or "bankroll cap")
-            return
-        target = bankroll_target
-
-        decision = self.risk.check_entry(
-            asset=market.asset,
-            stake_usd=target,
-            window_exposure_usd=self.store.interval_exposure(
-                self.runtime.mode, market.window, market.end
-            ),
-            day_exposure_usd=self.store.exposure_since(self.runtime.mode, _start_of_day(now)),
-            realized_pnl=self.store.stats(self.runtime.mode)["total_pnl"],
-            max_per_trade=runtime["max_per_trade_usd"],
-            max_per_window=runtime["max_per_window_usd"],
-            daily_cap=runtime["daily_cap_usd"],
-            ask_depth_usd=signal.ask_depth_usd,
-            now=now,
-        )
-        if not decision.allowed:
-            return
-
-        fill = await self._execute_buy(
-            market, signal.side, decision.size_usd, signal.entry_price
-        )
-        if fill is None:
-            return
-
-        next_switches = int(side_switches) + 1
-        self.store.open_position(
-            mode=self.runtime.mode,
-            slug=market.slug,
-            asset=market.asset,
-            window=market.window,
-            side=signal.side,
-            confidence=signal.confidence,
-            entry_price=fill.avg_price,
-            shares=fill.shares,
-            stake_usd=fill.stake_usd,
-            anchor_price=self._anchors.get(market.slug) or signal.anchor_price,
-            opened_at=fill.ts,
-            window_end=market.end,
-            switches=next_switches,
-            order_id=None,
-            question=market.question,
-        )
-        self.risk.record_entry(now)
-        self.stats.entries += 1
-        candidate = self._reversal_candidates.pop(market.slug, {})
-        self.store.log(
-            self.runtime.mode, "reversal",
-            f"{market.asset.upper()} {market.window} side switch "
-            f"{position['side'].upper()} -> {signal.side.upper()} "
-            f"{signal.confidence:.0%} @ {fill.avg_price:.2f}",
-            asset=market.asset, slug=market.slug,
-            detail=(
-                f"expected ROI {signal.expected_roi:.1%}, ${fill.stake_usd:.2f} staked, "
-                f"confirmed by {candidate.get('observations', 0)} observations over "
-                f"{max(0.0, now - float(candidate.get('first_seen', now))):.1f}s, "
-                f"switch {next_switches}/{int(entry.get('max_side_switches', 0))}"
-            ),
-        )
-
-    def _reversal_confirmed(self, slug: str, side: str, now: float) -> bool:
-        """Return true only after consecutive, time-spanning opposite signals."""
-        entry = self.config["entry"]
-        min_seconds = max(
-            0.0, float(entry.get("reversal_confirmation_seconds", 0.0))
-        )
-        min_observations = max(
-            1, int(entry.get("reversal_min_observations", 1))
-        )
-        poll = max(
-            0.5,
-            float(self.config.get("engine", {}).get("poll_interval_seconds", 3.0)),
-        )
-        candidates = getattr(self, "_reversal_candidates", None)
-        if candidates is None:
-            candidates = self._reversal_candidates = {}
-        candidate = candidates.get(slug)
-        if (
-            candidate is None
-            or candidate["side"] != side
-            or now - float(candidate["last_seen"]) > poll * 1.75
-        ):
-            candidate = {
-                "side": side,
-                "first_seen": now,
-                "last_seen": now,
-                "observations": 1,
-            }
-            candidates[slug] = candidate
-        else:
-            candidate["last_seen"] = now
-            candidate["observations"] = int(candidate["observations"]) + 1
-
-        return bool(
-            int(candidate["observations"]) >= min_observations
-            and now - float(candidate["first_seen"]) >= min_seconds
-        )
 
     async def _execute_buy(
         self,
@@ -1397,8 +1057,9 @@ class Engine:
         The live path is intentionally allowed to raise: a live order that fails
         must be loud, not silently downgraded to a paper fill.
         """
-        entry_config = getattr(self, "config", {}).get("entry", {})
-        hard_entry_price = float(entry_config.get("max_entry_price", 1.0))
+        hard_entry_price = float(
+            getattr(self, "config", {}).get("strategy", {}).get("max_entry_price", 1.0)
+        )
         if max_price > hard_entry_price:
             self.stats.reject(
                 f"entry {max_price:.2f} above "
@@ -1546,41 +1207,259 @@ class Engine:
         for mode in ("paper", "live"):
             self._settle_mode(mode, now)
 
+    async def reconcile_settlements(self, now: float) -> dict[str, Any]:
+        """Replace provisional spot verdicts with the outcome the venue published.
+
+        Settlement runs in two phases because the two things it does have
+        opposite deadlines. Releasing capital must happen the instant a window
+        closes, or exposure piles up against the bankroll cap and the bot stops
+        trading. Being *right* cannot happen then, because the venue does not
+        publish for minutes to tens of minutes after the close.
+
+        So a window books immediately on the spot proxy, and this pass corrects
+        it afterwards. That matters because the proxy is not merely noisy: the
+        exchanges we poll are not the Chainlink stream the venue resolves on,
+        and across 27,679 replayed windows the inferred verdict was wrong 13.7%
+        of the time — enough to turn a measured +$18.6k into -$8.8k.
+
+        Corrections are P/L-neutral for capital that has already moved; they
+        only fix the ledger, which is what every strategy decision is judged on.
+        """
+        poly = getattr(self, "poly", None)
+        if poly is None or not hasattr(poly, "resolution"):
+            return {"checked": 0, "corrected": 0}
+        resolutions = getattr(self, "_resolutions", None)
+        if resolutions is None:
+            resolutions = self._resolutions = {}
+
+        rows = self.store.provisional_settlements(
+            now - SETTLEMENT_RECONCILE_LOOKBACK_SECONDS
+        )
+
+        # Windows that have closed but could not be settled from any price
+        # series — after a restart, or when a feed drops mid-window. They are
+        # the ones that most need the venue, since it is the only route left
+        # that requires no price, so their resolutions are fetched here too.
+        stranded: set[str] = set()
+        for mode in ("paper", "live"):
+            for position in self.store.open_positions(mode):
+                if now >= float(position["window_end"]) + SETTLE_GRACE_SECONDS:
+                    stranded.add(position["slug"])
+
+        if not rows and not stranded:
+            return {"checked": 0, "corrected": 0}
+
+        wanted = {r["slug"] for r in rows} | stranded
+        unknown = sorted({s for s in wanted if s not in resolutions})
+        if unknown:
+            results = await asyncio.gather(
+                *(poly.resolution(slug) for slug in unknown),
+                return_exceptions=True,
+            )
+            for slug, outcome in zip(unknown, results):
+                if outcome in ("up", "down"):
+                    resolutions[slug] = outcome
+
+        corrected = 0
+        delta = 0.0
+        for row in rows:
+            outcome = resolutions.get(row["slug"])
+            if outcome is None:
+                continue
+            won = 1 if str(row["side"]).strip().lower() == outcome else 0
+            payout = round(float(row["shares"]), 4) if won else 0.0
+            pnl = round(payout - float(row["stake_usd"]), 4)
+            if won == row["won"] and abs(pnl - float(row["pnl_usd"])) < 0.005:
+                # The proxy happened to agree. Still stamp it, so the row
+                # records that the venue confirmed it rather than that nobody
+                # ever checked.
+                self.store.apply_venue_outcome(
+                    row["id"], won, payout, float(row["pnl_usd"])
+                )
+                continue
+            self.store.apply_venue_outcome(row["id"], won, payout, pnl)
+            delta += pnl - float(row["pnl_usd"])
+            corrected += 1
+
+        if corrected:
+            self.store.log(
+                self.runtime.mode, "settlement",
+                f"Venue reconcile: {corrected} of {len(rows)} settlements corrected "
+                f"({delta:+.2f} P/L)",
+                detail="spot inferred the wrong side; the venue's outcome now stands",
+            )
+        return {"checked": len(rows), "corrected": corrected, "delta": round(delta, 4)}
+
+    def _release_window(self, slug: str) -> None:
+        """Drop the strategy's ladder bookkeeping for a finished window.
+
+        The strategy tracks open cost and open-window count in memory to
+        enforce ``max_capital_usd`` and ``max_open_windows``. Nothing else
+        clears it, so without this every settled window would keep consuming
+        both budgets and the strategy would ratchet itself shut after a few
+        hours — the ledger would show no open exposure while the strategy
+        refused to trade. Tying the release to settlement keeps the two views
+        in agreement.
+
+        Deliberately tolerant of a missing strategy: this is bookkeeping, and
+        settling a real position must never fail because of it.
+        """
+        strategy = getattr(self, "antsaslyku", None)
+        if strategy is not None:
+            strategy.drop_window(slug)
+
+    def _settlement_pair(
+        self, state: Any, position: dict[str, Any], end: float
+    ) -> tuple[float | None, float | None, str | None]:
+        """An anchor and close for this window, both from one price series.
+
+        Coherence is the requirement, not any particular feed. Reading the
+        anchor from one series and the close from another measures the basis
+        between them, which is how a losing window came to be booked as a
+        +$228.51 win. But *pinning* to the series that produced the anchor is
+        too strict on its own: a restart rebuilds the buffer from scratch, so a
+        stream that connected after the window closed cannot supply its close,
+        and the position strands forever.
+
+        So the recorded source is preferred, and any other series that covers
+        both the open and the close is accepted as a whole — anchor re-derived
+        along with it, never spliced onto the old one.
+        """
+        start = end - WINDOW_SECONDS.get(position["window"], 0)
+        recorded = (
+            position["anchor_source"] or self._anchor_source_of(position["slug"])
+        )
+        anchor = position["anchor_price"] or self._anchors.get(position["slug"])
+
+        if recorded and anchor:
+            close = state.price_at_or_before(end, recorded)
+            if close is not None:
+                return float(anchor), float(close), recorded
+
+        for candidate in (recorded, RESOLUTION, EXCHANGE):
+            if candidate is None:
+                continue
+            open_price = state.price_at_or_before(start, candidate)
+            close = state.price_at_or_before(end, candidate)
+            if open_price is not None and close is not None:
+                return float(open_price), float(close), candidate
+        return None, None, None
+
+    def _settle_from_venue(
+        self, mode: str, position: dict[str, Any], outcome: str, now: float
+    ) -> None:
+        """Book a position against the outcome the venue published.
+
+        No price comparison is involved, so there is no feed, no basis and no
+        anchor to get wrong: the side either matches the winning outcome or it
+        does not, and a winning share pays exactly $1. The anchor and close we
+        observed are still recorded, so a later audit can see what the spot
+        model would have concluded and how often it disagreed.
+        """
+        won = str(position["side"]).strip().lower() == outcome
+        shares = float(position["shares"])
+        stake = float(position["stake_usd"])
+        payout = round(shares, 4) if won else 0.0
+        pnl = round(payout - stake, 4)
+
+        state = self.spot.get(position["asset"])
+        source = (
+            position["anchor_source"] or self._anchor_source_of(position["slug"])
+        )
+        close_price = (
+            state.price_at_or_before(float(position["window_end"]), source)
+            if state is not None and source
+            else None
+        )
+
+        self.store.record_settlement(
+            position_id=position["id"],
+            mode=mode,
+            slug=position["slug"],
+            asset=position["asset"],
+            window=position["window"],
+            side=position["side"],
+            confidence=position["confidence"],
+            entry_price=position["entry_price"],
+            shares=position["shares"],
+            stake_usd=position["stake_usd"],
+            payout_usd=payout,
+            pnl_usd=pnl,
+            won=1 if won else 0,
+            anchor_price=position["anchor_price"],
+            close_price=close_price,
+            settled_at=now,
+            method="venue",
+            anchor_source="venue",
+            strategy=position["strategy"],
+        )
+        self.store.close_position(position["id"], "settled")
+        self._release_window(position["slug"])
+        self.store.log(
+            mode, "settlement",
+            f"{position['asset'].upper()} {position['window']} "
+            f"{str(position['side']).upper()} {'WON' if won else 'LOST'} {pnl:+.2f}",
+            asset=position["asset"], slug=position["slug"],
+            detail=f"venue resolved {outcome.upper()}",
+        )
+
     def _settle_mode(self, mode: str, now: float) -> None:
         for position in self.store.open_positions(mode):
             end = float(position["window_end"])
             if now < end + SETTLE_GRACE_SECONDS:
                 continue
 
+            # If the venue has already answered — an older window being settled
+            # after a restart, or one the reconciler has cached — use it. It
+            # needs no price at all: a winning share pays $1, a losing one 0.
+            # Otherwise settle provisionally on spot below and let the
+            # reconciler correct it; holding out for the venue here would pin
+            # capital for the better part of an hour.
+            outcome = getattr(self, "_resolutions", {}).get(position["slug"])
+            if outcome is not None:
+                self._settle_from_venue(mode, position, outcome, now)
+                continue
+
             state = self.spot.get(position["asset"])
             if state is None:
                 # A previously enabled asset may later be removed from the feed
-                # configuration. It can never acquire a close tick, so release
-                # its exposure after the normal settlement recovery timeout.
-                if now > end + 300:
+                # configuration, so it can never acquire a close tick. The
+                # venue can still resolve it — that check ran above and will
+                # run again next loop — so hold rather than abandon a real
+                # stake over a config change.
+                if now > end + UNRESOLVED_ABANDON_SECONDS:
                     self.store.close_position(position["id"], "unresolved")
+                    self._release_window(position["slug"])
                     self.store.log(
                         mode,
                         "warn",
-                        f"{position['asset'].upper()} {position['window']} could not settle: "
-                        "no settlement feed for this asset.",
+                        f"{position['asset'].upper()} {position['window']} abandoned: "
+                        "no settlement feed for this asset and no venue outcome. "
+                        f"${float(position['stake_usd']):.2f} is missing from this "
+                        "ledger's P/L.",
                         asset=position["asset"],
                         slug=position["slug"],
                     )
                 continue
 
-            close_price = state.price_at_or_before(end)
-            anchor = position["anchor_price"] or self._anchors.get(position["slug"])
+            anchor, close_price, source = self._settlement_pair(state, position, end)
             if close_price is None or not anchor:
-                # Without both prices we cannot decide the outcome. Leave the
-                # position open rather than guess; it settles once spot data
-                # covering the boundary is available.
-                if now > end + 300:
+                # No series covers both ends of this window. Hold — the venue
+                # will answer, and _settle_from_venue needs no price at all.
+                # Abandoning here would close the position with no settlement
+                # row, which does not merely lose the P/L: it deletes a real
+                # stake from the ledger, so the strategy looks like it never
+                # made the trade.
+                if now > end + UNRESOLVED_ABANDON_SECONDS:
                     self.store.close_position(position["id"], "unresolved")
+                    self._release_window(position["slug"])
                     self.store.log(
                         mode, "warn",
-                        f"{position['asset'].upper()} {position['window']} could not settle — "
-                        "no spot price covering the window close.",
+                        f"{position['asset'].upper()} {position['window']} abandoned after "
+                        f"{UNRESOLVED_ABANDON_SECONDS / 3600:.0f}h — no price series covers "
+                        "the window and the venue never published an outcome. "
+                        f"${float(position['stake_usd']):.2f} is missing from this "
+                        "ledger's P/L.",
                         asset=position["asset"], slug=position["slug"],
                     )
                 continue
@@ -1610,8 +1489,15 @@ class Engine:
                 close_price=close_price,
                 settled_at=now,
                 method="spot",
+                anchor_source=source,
+                # Inherited from the position rather than from whatever is
+                # selected now: a window opened by one strategy must settle
+                # into that strategy's curve even if the operator has since
+                # switched.
+                strategy=position["strategy"],
             )
             self.store.close_position(position["id"], "settled")
+            self._release_window(position["slug"])
             verdict = "WON" if result["won"] else "LOST"
             self.store.log(
                 mode, "settlement",
@@ -1623,12 +1509,23 @@ class Engine:
 
     # -- reporting ---------------------------------------------------------
 
-    def open_positions_view(self) -> list[dict[str, Any]]:
+    def open_positions_view(
+        self, strategy: str | None = None
+    ) -> list[dict[str, Any]]:
         """Open positions enriched with live spot progress for the UI."""
         out = []
-        for position in self.store.open_positions(self.runtime.mode):
+        for position in self.store.open_positions(self.runtime.mode, strategy):
             state = self.spot.get(position["asset"])
-            spot = state.last_price if state else None
+            # Read the live price from the series this window was anchored on,
+            # so "ahead"/"behind" answers the same question settlement will.
+            # Against the other feed it compares across the basis and can show
+            # a winning position as losing right up to the moment it settles.
+            source = (
+                position["anchor_source"]
+                or self._anchor_source_of(position["slug"])
+            )
+            latest = state.latest_from(source) if state and source else None
+            spot = latest[1] if latest else (state.last_price if state else None)
             anchor = position["anchor_price"]
             status = "Awaiting spot"
             ahead: bool | None = None
@@ -1697,7 +1594,8 @@ class Engine:
             "bankroll": self.bankroll_status(),
             "performance_targets": self.performance_target_status(),
             "strategy": self.strategy,
-            "maker": {**self.maker.snapshot(), **self.maker_stats},
+            "strategies": {self.antsaslyku.NAME: self.antsaslyku.snapshot()},
+            "strategy_selection": self.strategy_status(),
         }
 
 
