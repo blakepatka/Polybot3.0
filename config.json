@@ -65,9 +65,13 @@
     "average_down_enabled": true,
 
     "_hedge_note": "OPERATOR DECISION 2026-08-15: enabled to reproduce the wallet literally. 52.0% of its windows open a second leg, a median 66s after the first fill. The two legs together cost a median $1.042 and only 35.6% of its 52,816 hedges came in under $1.00 — so this is NOT arbitrage; buying a pair above $1.00 books a loss at the moment of the fill. Holding entries fixed, the full ladder+hedge returned +2.05% on $4.19M where the first side alone returned +2.02% on $2.73M: the hedge buys 5.9x the capital for the same return per dollar. Set hedge_enabled=false, or hedge_max_combined_cost=1.0 to admit only genuine locks.",
+    "_switching_note": "Confirmed against live activity 2026-08-15: BTC 1:25-1:30 went Up 71c -> Down 39c -> Down 39c -> Down 12c, and XRP 1:25-1:30 went Down 34c -> Up 67c -> Down 37c -> Down 51c -> Up 34c inside about a minute. It switches sides freely and repeatedly, and once it holds both sides it simply adds to whichever it currently likes. One confirming scan, not two: at a 3s poll a two-tick confirmation costs 6s per switch, which is most of the move on a 300s window.",
     "hedge_enabled": true,
-    "hedge_after_adverse_ticks": 2,
+    "hedge_after_adverse_ticks": 1,
     "hedge_max_combined_cost": 99.0,
+
+    "_partial_fill_note": "The wallet fills at exactly 5.0 shares constantly ($1.68 at 32c, $1.78 at 34c, $2.64 at 51c) because orderMinSize is five SHARES and a limit order takes whatever is resting. The paper broker used to reject any clip the book could not fill in full, which silently skipped a large share of these trades.",
+    "allow_partial_fill": true,
 
     "_exposure_note": "The wallet's own envelope: peak 8 concurrent windows, cost per window median $19.28 / p90 $96.43 / max $2,418.53, turning over a median $33,667 a day. These are the outer bound only — the mandatory bankroll controls below are applied afterwards and are what actually binds at a small balance.",
     "max_cost_per_window_usd": 120.0,
@@ -116,8 +120,9 @@
   },
 
   "risk": {
+    "_circuit_breaker_note": "Raised from 5 to 30 on 2026-08-15. This guard exists to stop a runaway loop, not to cap a laddering strategy: the wallet being cloned averages 5.94 fills per 5m window across up to 8 concurrent windows, so 5 entries per 60s fights the strategy rather than protecting it — it tripped 24 times in a five-minute paper run. 30 still stops a genuine runaway well inside one window.",
     "circuit_breaker": {
-      "max_consecutive_large_trades": 5,
+      "max_consecutive_large_trades": 30,
       "window_seconds": 60,
       "cooldown_seconds": 300
     },

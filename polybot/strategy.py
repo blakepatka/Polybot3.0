@@ -186,6 +186,9 @@ class WindowState:
             return None
         return self.side_cost.get(side, 0.0) / shares
 
+    def held_sides(self) -> set[str]:
+        return {s for s, v in self.side_shares.items() if v > 0}
+
     @property
     def sides_held(self) -> int:
         return sum(1 for v in self.side_shares.values() if v > 0)
@@ -334,7 +337,11 @@ class AntsaslykuStrategy:
         # (or hedge_max_combined_cost=1.0 to admit only genuine locks) to trade
         # the measured-profitable subset instead.
         self.hedge_enabled = bool(cfg.get("hedge_enabled", True))
-        self.hedge_after_adverse_ticks = int(cfg.get("hedge_after_adverse_ticks", 2))
+        # One confirming scan, not two. Observed live on 2026-08-15, the XRP
+        # 1:25-1:30 window went Down 34c -> Up 67c -> Down 37c -> Down 51c ->
+        # Up 34c inside about a minute. At a 3s poll a two-tick confirmation
+        # costs 6s per switch, which is most of the move on a 300s window.
+        self.hedge_after_adverse_ticks = int(cfg.get("hedge_after_adverse_ticks", 1))
         self.hedge_max_combined_cost = float(cfg.get("hedge_max_combined_cost", 99.0))
 
         # -- exposure ---------------------------------------------------------
@@ -484,16 +491,20 @@ class AntsaslykuStrategy:
             return None
         edge, side, limit_price, confidence = best
 
-        # A flip against the leg already held is the hedge trigger, not a new
-        # directional entry.
-        is_flip = st.first_side is not None and side != st.first_side
-        if is_flip:
+        # Wanting a side we do not yet hold is a *switch*. Keyed to what is
+        # actually held, not to whichever side happened to be first: once both
+        # sides are held the wallet simply adds to whichever one it currently
+        # likes, and a first-side-relative rule would mislabel half of that and
+        # gate it behind a confirmation it does not need.
+        held = st.held_sides()
+        is_switch = bool(held) and side not in held
+        if is_switch:
             st.adverse_streak += 1
         else:
             st.adverse_streak = 0
 
         book = market.book_for(side)
-        stage = self._stage(st, is_flip)
+        stage = self._stage(st, is_switch)
 
         # Stake what the wallet stakes at this price, but never less than the
         # venue's five-share minimum — below that the order is unplaceable.
@@ -524,11 +535,11 @@ class AntsaslykuStrategy:
             self.stats["intents"] += 1
         return intent
 
-    def _stage(self, st: WindowState, is_flip: bool) -> str:
+    def _stage(self, st: WindowState, is_switch: bool) -> str:
         """Which rung of the observed ladder this clip sits on."""
         if st.fills == 0:
             return "open"
-        if is_flip:
+        if is_switch:
             return "hedge"
         return "add"
 
@@ -606,7 +617,12 @@ class AntsaslykuStrategy:
                     f"adverse streak {st.adverse_streak} < "
                     f"{self.hedge_after_adverse_ticks}"
                 )
-            held_vwap = st.vwap(st.first_side or "")
+            # Price the pair against the side we are actually holding, whichever
+            # that is. Observed live: BTC 1:25-1:30 went Up 71c -> Down 39c ->
+            # Down 39c -> Down 12c, and XRP flipped four times in a minute, so
+            # the leg being switched away from is not necessarily the first one.
+            other = next(iter(st.held_sides() - {intent.side}), None)
+            held_vwap = st.vwap(other) if other else None
             if held_vwap is not None:
                 combined = held_vwap + intent.limit_price
                 if combined > self.hedge_max_combined_cost:

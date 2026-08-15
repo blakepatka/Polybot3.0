@@ -9,8 +9,14 @@ market would never have given.
 
 Two further rules keep paper honest:
 
-* A clip that the visible book cannot fill in full is **rejected**, not
-  partially filled at a fictional price.
+* A partial fill is allowed, but only down to the venue's real minimum and only
+  at prices the book actually shows. The wallet being replicated fills at
+  exactly 5.0 shares constantly — $1.68 at 32c, $1.78 at 34c, $2.64 at 51c —
+  because ``orderMinSize`` is five *shares* and a limit order takes whatever is
+  resting. Rejecting those outright, as this broker used to, silently skipped a
+  large share of the trades the strategy is supposed to make. What is still
+  refused is a fill below the venue minimum, or one invented at a price no
+  level offered.
 * Taker rebates are never credited. The reference wallet earns account-tier
   rebates; counting them here would let an unearned tier turn a losing strategy
   into a profitable-looking one.
@@ -77,6 +83,14 @@ class PaperBroker:
         self.taker_rate = float(fees.get("taker_rate", 0.07))
         self.fee_exponent = float(fees.get("exponent", 1.0))
         self.min_order_size = float(config["risk"]["trade_floor"]["min_trade_size_usd"])
+        # The venue's floor is a share count, not a dollar amount.
+        self.min_order_shares = float(
+            (config.get("strategy") or {}).get("min_order_shares", 5.0)
+        )
+        # Take what the book is showing rather than refusing the whole clip.
+        self.allow_partial_fill = bool(
+            (config.get("strategy") or {}).get("allow_partial_fill", True)
+        )
 
     def plan_buy(
         self,
@@ -99,6 +113,15 @@ class PaperBroker:
         ]
         if not levels:
             return None
+
+        # What the eligible levels can actually absorb. A budget larger than this
+        # is trimmed to it rather than refused, which is what makes the exactly
+        # 5.0-share fills the wallet shows reproducible.
+        book_capacity = sum(price * size for price, size in levels)
+        if self.allow_partial_fill:
+            budget_usd = min(budget_usd, book_capacity)
+            if budget_usd < self.min_order_size:
+                return None
 
         def walk(gross_usd: float) -> tuple[float, float, float, int] | None:
             remaining = gross_usd
@@ -153,10 +176,15 @@ class PaperBroker:
         )
         total_usd = gross_usd + fee_usd
 
-        # Reject a thin book instead of silently shrinking a $5 decision into
-        # a materially smaller order. One cent of amount rounding plus a small
-        # floating-point tolerance is acceptable.
-        if total_usd < budget_usd - 0.02 or total_usd > budget_usd + 1e-6:
+        # Never spend more than asked. Under-spending is only allowed when the
+        # book genuinely could not supply more — never as silent shrinkage.
+        if total_usd > budget_usd + 1e-6:
+            return None
+        if total_usd < budget_usd - 0.02 and not self.allow_partial_fill:
+            return None
+
+        # A partial fill still has to be a placeable order.
+        if shares + 1e-9 < self.min_order_shares:
             return None
 
         return BuyPlan(

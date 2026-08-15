@@ -413,13 +413,92 @@ class HedgeTests(unittest.TestCase):
             switches, 3, "the clone must be able to switch sides more than once"
         )
 
-    def test_one_adverse_tick_is_not_enough(self):
+    def test_a_single_confirming_scan_arms_the_switch(self):
+        """Observed live: XRP 1:25-1:30 flipped four times inside a minute.
+        At a 3s poll a two-tick confirmation costs 6s per switch, which is most
+        of the move on a 300s window."""
         s = build()
+        self.assertEqual(s.hedge_after_adverse_ticks, 1)
+        m = market()
+        s.evaluate(m, spot(drift_ratio=1.0005), NOW)
+        s.record_fill(m.slug, "up", 5.0, 9.0, "open", NOW - 30)
+        intent = s.evaluate(m, spot(drift_ratio=0.9995), NOW)
+        self.assertEqual(intent.stage, "hedge")
+        self.assertIsNone(intent.reason, intent.reason)
+
+    def test_a_confirmation_can_still_be_required(self):
+        s = build(hedge_after_adverse_ticks=2)
         m = market()
         s.evaluate(m, spot(drift_ratio=1.0005), NOW)
         s.record_fill(m.slug, "up", 5.0, 9.0, "open", NOW - 30)
         intent = s.evaluate(m, spot(drift_ratio=0.9995), NOW)
         self.assertIn("adverse streak", intent.reason)
+
+    def test_once_both_sides_are_held_either_is_an_add(self):
+        """The wallet stops 'hedging' and simply adds to whichever side it
+        currently likes — a first-side-relative rule would mislabel that and
+        gate it behind a confirmation it does not need."""
+        s = build()
+        m = market()
+        s.record_fill(m.slug, "up", 5.0, 9.0, "open", NOW - 60)
+        s.record_fill(m.slug, "down", 5.0, 9.0, "hedge", NOW - 40)
+        for drift in (1.0005, 0.9995):
+            with self.subTest(drift=drift):
+                intent = s.evaluate(m, spot(drift_ratio=drift), NOW)
+                self.assertEqual(intent.stage, "add")
+                self.assertIsNone(intent.reason, intent.reason)
+
+    def test_the_btc_sequence_observed_live_is_reproducible(self):
+        """BTC 1:25-1:30PM ET: Up 71c -> Down 39c -> Down 39c -> Down 12c.
+
+        Three regime changes in one 5m window. The drift runs up (buy Up at
+        71c), reverses (buy Down at 39c twice), then runs up again — leaving
+        Down at 12c, which is bought as a cheap longshot rather than a
+        conviction bet. Each leg's drift is chosen so the model's claimed edge
+        stays inside the plausible range; the point is the mechanism, not the
+        exact cents.
+        """
+        s = build()
+        m = market(up_ask=0.70, down_ask=0.31)
+        first = s.evaluate(m, spot(drift_ratio=1.0012), NOW)
+        self.assertEqual(first.side, "up")
+        self.assertIsNone(first.reason, first.reason)
+        s.record_fill(m.slug, "up", first.size_usd, 6.8, "open", NOW - 120)
+
+        # Drift reverses: Down reprices to 38c and is now the favoured side.
+        for _ in range(2):
+            m.books["down"] = Book(
+                asks=BookSide([(0.38, 900.0)]),
+                bids=BookSide([(0.36, 900.0)]), ts=NOW,
+            )
+            intent = s.evaluate(m, spot(drift_ratio=0.9998), NOW)
+            self.assertEqual(intent.side, "down")
+            self.assertIsNone(intent.reason, intent.reason)
+            s.record_fill(m.slug, "down", intent.size_usd,
+                          intent.size_usd / intent.limit_price,
+                          intent.stage, NOW - 100)
+
+        # Drift runs up again, leaving Down at 12c — bought as a longshot, and
+        # sized down accordingly rather than taking a full clip. Both sides are
+        # repriced together: a 12c Down implies an ~88c Up, and at that price
+        # Up no longer clears its own all-in cost.
+        m.books["down"] = Book(
+            asks=BookSide([(0.11, 900.0)]),
+            bids=BookSide([(0.09, 900.0)]), ts=NOW,
+        )
+        m.books["up"] = Book(
+            asks=BookSide([(0.87, 900.0)]),
+            bids=BookSide([(0.85, 900.0)]), ts=NOW,
+        )
+        last = s.evaluate(m, spot(drift_ratio=1.0012), NOW)
+        self.assertEqual(last.side, "down")
+        self.assertIsNone(last.reason, last.reason)
+        self.assertLess(last.size_usd, 3.5, "a 12c longshot is not a full clip")
+        s.record_fill(m.slug, "down", last.size_usd, 33.3, last.stage, NOW - 60)
+
+        state = s.state_for(m.slug)
+        self.assertEqual(state.sides_held, 2)
+        self.assertEqual(state.fills, 4)
 
 
 class ExposureTests(unittest.TestCase):

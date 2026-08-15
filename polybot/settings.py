@@ -89,8 +89,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "add_into_strength": True,
         "average_down_enabled": True,
         "hedge_enabled": True,
-        "hedge_after_adverse_ticks": 2,
+        "hedge_after_adverse_ticks": 1,
         "hedge_max_combined_cost": 99.0,
+        "allow_partial_fill": True,
         "max_cost_per_window_usd": 120.0,
         "max_open_windows": 8,
         "max_capital_usd": 650.0,
@@ -127,7 +128,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "risk": {
         "circuit_breaker": {
-            "max_consecutive_large_trades": 5,
+            # A runaway-loop guard, not a ladder cap — see config.json.
+            "max_consecutive_large_trades": 30,
             "window_seconds": 60,
             "cooldown_seconds": 300,
         },

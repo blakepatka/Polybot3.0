@@ -94,6 +94,38 @@ These were live defects, not suggestions.
 
 ---
 
+## 3b. The clone needs ~$250–650 of working capital; at $50 it is capital-capped
+
+Measured over a five-minute paper run on 2026-08-15 with the switching fixes in:
+**458 tradeable intents produced 10 fills.** The rejections say why, and none of
+them are the strategy:
+
+| Blocker | Hits | What it is |
+|---|---|---|
+| `hard market-window cap` ($10) | 228 | 2 fills per window, vs the wallet's 5.94 |
+| `hard shared-window cap` ($25) | 195 | 5 fills per timed interval across 4 assets |
+| `max open 15m windows` (3) | 41 | intended |
+| Circuit breaker (5 / 60s) | 24 | **mis-scaled — now 30** |
+| Bankroll open exposure | — | **$49.95 of $50.00, i.e. full** |
+
+The wallet runs a median $19.28 per window across up to 8 concurrent windows.
+Reproducing that shape needs roughly **$250 minimum and ~$650 to match its
+observed peak**. At $50 the bankroll cap binds before any strategy parameter
+does, so the clone runs as a truncated version of itself no matter what
+`max_fills_per_window` says.
+
+Fixed here: the circuit breaker, which was a runaway-loop guard being used as a
+ladder cap and tripped 24 times in five minutes.
+
+**Decision for the operator, not for this code:** either fund it toward $250+
+and let the ladder run, or accept the truncated clone and set
+`max_fills_per_window: 2` + `hedge_enabled: false` — which is the
+profit-maximising configuration anyway (+2.72% vs +2.05%) and happens to fit a
+small bankroll. Raising the per-window caps *without* raising the bankroll just
+concentrates the same $50 into fewer windows.
+
+---
+
 ## 4. Bankroll settings that block evidence
 
 At a $50 bankroll with $5 clips, `max_daily_loss_usd: 5.0` is **one losing
