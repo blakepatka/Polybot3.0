@@ -148,6 +148,9 @@ class Intent:
     # Guaranteed profit this order would lock in, when it makes the window
     # risk-free. Zero for every ordinary entry.
     lock_profit_usd: float = 0.0
+    # True when the size was computed from the window's imbalance in order to
+    # steer it toward a lock, rather than from the flat clip.
+    balancing: bool = False
     reason: str | None = None  # populated when the intent is not tradeable
 
     @property
@@ -157,6 +160,17 @@ class Intent:
     @property
     def is_lock(self) -> bool:
         return self.lock_profit_usd > 0.0
+
+    @property
+    def model_independent(self) -> bool:
+        """Whether this order's case rests on arithmetic rather than a forecast.
+
+        A lock pays out whichever side resolves. A balancing leg is bounded to
+        near break-even by construction. Neither depends on the model being
+        right, so neither should be judged by the gates that decide when the
+        model is trustworthy.
+        """
+        return self.is_lock or self.balancing
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -390,6 +404,33 @@ class AntsaslykuStrategy:
         # Skip locks too small to be worth the fees and the exposure.
         self.min_lock_profit_usd = float(cfg.get("min_lock_profit_usd", 0.10))
 
+        # -- balancing ---------------------------------------------------------
+        # Only 7.31% of the wallet's two-sided windows finish as strict locks,
+        # but that undersells what it is doing. Walked fill-by-fill it is
+        # visibly *steering* windows toward one. Observed 2026-08-15, XRP
+        # 1:25-1:30:
+        #
+        #     +69s  Up   0.47  $4.37   9.0sh  -> cost $ 4.37  guaranteed $ 0.00
+        #    +112s  Up   0.78  $4.95   6.2sh  -> cost $ 9.32  guaranteed $ 0.00
+        #    +130s  Down 0.22  $8.81  38.5sh  -> cost $18.13  guaranteed $15.21
+        #    +153s  Up   0.82  $9.13  11.0sh  -> cost $27.26  guaranteed $26.21
+        #
+        # A big cheap block takes the guaranteed payout from nothing to most of
+        # the cost, then it tops up the other leg. It finishes at a -$1.05 worst
+        # case against +$11.20 upside — not a lock, but close enough that the
+        # downside is nearly gone.
+        #
+        # A flat clip cannot do this: the size has to be computed from the
+        # imbalance. But balancing *unconditionally* is what makes the wallet's
+        # hedging lose money (-3.11% over 52,816 windows), so it is allowed only
+        # while it keeps the worst case within this fraction of total cost. The
+        # XRP window above lands at -3.9%; the ETH 15m one the same hour ran to
+        # -35% and is exactly what this refuses.
+        self.balance_enabled = bool(cfg.get("balance_enabled", True))
+        self.max_worst_case_loss_frac = float(
+            cfg.get("max_worst_case_loss_frac", 0.05)
+        )
+
         # -- exposure ---------------------------------------------------------
         # The wallet's own envelope: peak 8 concurrent windows, median $19.28
         # and p90 $96.43 of cost per window, peak $2,418. These are the outer
@@ -405,6 +446,10 @@ class AntsaslykuStrategy:
         # taker fee, and confirming that every ROI quoted above is fee-inclusive.
         self.slippage_ticks = int(cfg.get("slippage_ticks", 1))
         self.min_depth_usd = float(cfg.get("min_depth_usd", 25.0))
+        # Depth required as a multiple of the order itself. The flat floor above
+        # becomes the ceiling on this, so a $5 clip still wants $25 of book
+        # while a $0.05 longshot wants $0.25 rather than 500x its own size.
+        self.depth_multiple = float(cfg.get("depth_multiple", 5.0))
 
         fees = config.get("fees", {})
         self.taker_rate = float(fees.get("taker_rate", 0.07))
@@ -515,6 +560,46 @@ class AntsaslykuStrategy:
             return None
         return need * q, profit
 
+    def balance_for(
+        self, st: WindowState, side: str, limit_price: float
+    ) -> tuple[float, float] | None:
+        """Size an order that steers this window toward a lock.
+
+        Returns ``(size_usd, resulting_worst_case_usd)``. This is the weaker
+        sibling of :meth:`lock_for`: it fires when buying the deficient side
+        cannot make the window strictly risk-free but *can* pull the worst case
+        up to within :attr:`max_worst_case_loss_frac` of the total cost.
+
+        That constraint is the whole point. Buying the other side of a losing
+        window with no condition attached is precisely the behaviour that lost
+        the wallet money — its two-sided windows realised -3.11% over 52,816 of
+        them. Requiring the result to land near break-even keeps the cases that
+        look like the XRP window above and rejects the ones that are just
+        averaging into a loser.
+        """
+        other = next(iter(st.held_sides() - {side}), None)
+        if other is None:
+            return None
+        s_other = st.side_shares.get(other, 0.0)
+        s_this = st.side_shares.get(side, 0.0)
+        need = s_other - s_this
+        if s_other <= 0 or need <= 0:
+            return None
+
+        q = self.all_in_cost(limit_price)
+        if q >= 1.0:
+            return None
+
+        # Buying the full shortfall maximises the guaranteed payout.
+        cost_after = st.cost_usd + need * q
+        worst = s_other - cost_after
+        if worst < -abs(self.max_worst_case_loss_frac) * cost_after:
+            return None
+        # Must actually improve on doing nothing.
+        if worst <= min(s_other, s_this) - st.cost_usd:
+            return None
+        return need * q, worst
+
     def min_stake_for(self, price: float, market: MarketWindow | None = None) -> float:
         """Smallest order the venue will accept at this price, in dollars.
 
@@ -582,6 +667,35 @@ class AntsaslykuStrategy:
             return None
         edge, side, limit_price, confidence = best
 
+        # A guaranteed profit outranks a marginal directional edge.
+        #
+        # The loop above picks whichever side the book underprices most, and
+        # that is right for an ordinary entry. But it means a window where we
+        # already hold the model's favourite never gets asked the only question
+        # that does not depend on the model at all: would buying the OTHER side
+        # make this window pay whatever happens?
+        #
+        # This is why the clone switched on 4.8% of fills where the wallet is
+        # two-sided on 52% of windows. The wallet does not wait for its view to
+        # flip before buying the cheap side — it buys it because it is cheap.
+        if self.lock_when_available and st.held_sides():
+            for candidate in ("up", "down"):
+                if candidate == side:
+                    continue
+                cbook = market.book_for(candidate)
+                if cbook is None or cbook.asks.best is None:
+                    continue
+                climit = min(
+                    0.999,
+                    cbook.asks.best + self.slippage_ticks * market.tick_size,
+                )
+                if self.lock_for(st, candidate, climit) is None:
+                    continue
+                side, limit_price = candidate, climit
+                confidence = read.probability_for(candidate)
+                edge = confidence - self.all_in_cost(climit)
+                break
+
         # Wanting a side we do not yet hold is a *switch*. Keyed to what is
         # actually held, not to whichever side happened to be first: once both
         # sides are held the wallet simply adds to whichever one it currently
@@ -609,10 +723,21 @@ class AntsaslykuStrategy:
         # the one case where the second leg is unambiguously worth buying, and
         # it is 7.31% of its two-sided windows.
         lock_profit = 0.0
-        if self.lock_when_available and stage in ("hedge", "add"):
-            lock = self.lock_for(st, side, limit_price)
+        balancing = False
+        if stage in ("hedge", "add"):
+            lock = (
+                self.lock_for(st, side, limit_price)
+                if self.lock_when_available else None
+            )
             if lock is not None:
                 size_usd, lock_profit = lock
+            elif self.balance_enabled:
+                # No strict lock available, but the window can still be steered
+                # toward one. Sized from the imbalance, not from the clip.
+                bal = self.balance_for(st, side, limit_price)
+                if bal is not None:
+                    size_usd, _worst = bal
+                    balancing = True
 
         intent = Intent(
             slug=market.slug,
@@ -629,6 +754,7 @@ class AntsaslykuStrategy:
             seconds_into_window=read.seconds_elapsed,
             ask_depth_usd=book.asks.depth_usd(),
             lock_profit_usd=lock_profit,
+            balancing=balancing,
         )
         intent.reason = self._reject_reason(intent, market, st, read, now)
         if intent.reason:
@@ -677,7 +803,7 @@ class AntsaslykuStrategy:
         # block — depth, timing, exposure, the venue's own limits — still binds,
         # because those are about whether the order can actually be filled and
         # afforded.
-        if not intent.is_lock:
+        if not intent.model_independent:
             # The measured edge dies above 0.80, and the wallet never pays more
             # than a handful of cents below 0.02.
             if intent.limit_price > self.max_entry_price:
@@ -701,8 +827,18 @@ class AntsaslykuStrategy:
                     "implausible, treating the feed as unreliable"
                 )
 
-        if intent.ask_depth_usd < self.min_depth_usd:
-            return f"depth ${intent.ask_depth_usd:.0f} < ${self.min_depth_usd:.0f}"
+        # Depth is only a problem relative to the order. A flat floor demands
+        # $25 of book to place a $0.05 longshot, which refuses precisely the
+        # thin cheap side a balancing leg needs. Require a multiple of what we
+        # are actually spending, bounded by the configured floor.
+        needed_depth = min(
+            self.min_depth_usd, intent.size_usd * self.depth_multiple
+        )
+        if intent.ask_depth_usd < needed_depth:
+            return (
+                f"depth ${intent.ask_depth_usd:.2f} < ${needed_depth:.2f} "
+                f"needed for a ${intent.size_usd:.2f} order"
+            )
 
         # -- ladder gates -----------------------------------------------------
         if intent.stage != "open":
@@ -735,7 +871,7 @@ class AntsaslykuStrategy:
             # A lock needs no further justification: whichever side resolves,
             # the window pays more than it cost. Only non-lock hedges face the
             # combined-cost ceiling.
-            if not intent.is_lock:
+            if not intent.model_independent:
                 # Price the pair against the side actually held, whichever that
                 # is. Observed live: BTC 1:25-1:30 went Up 71c -> Down 39c ->
                 # Down 39c -> Down 12c, and XRP flipped four times in a minute,

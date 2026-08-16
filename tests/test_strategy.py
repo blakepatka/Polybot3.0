@@ -12,7 +12,12 @@ from types import SimpleNamespace
 
 from polybot.feeds.polymarket import Book, BookSide, MarketWindow
 from polybot.feeds.spot import EXCHANGE, AssetState
-from polybot.strategy import SANE_MAX_EDGE, AntsaslykuStrategy, WindowState
+from polybot.strategy import (
+    SANE_MAX_EDGE,
+    AntsaslykuStrategy,
+    Intent,
+    WindowState,
+)
 
 # Anchored to real time: AssetState prunes its tick buffer against
 # ``time.time()``, so a fixture pinned to a fixed past timestamp is pruned away
@@ -610,6 +615,139 @@ class LockTests(unittest.TestCase):
         intent = s.evaluate(m, spot(drift_ratio=0.9985), NOW)
         self.assertFalse(intent.is_lock)
         self.assertEqual(intent.lock_profit_usd, 0.0)
+
+
+class BalanceTests(unittest.TestCase):
+    """Steering a window toward a lock, which is what the wallet actually does.
+
+    Only 7.31% of its two-sided windows finish strictly risk-free, but walked
+    fill-by-fill it is visibly driving the worst case toward zero by sizing the
+    second leg from the imbalance rather than taking a flat clip.
+    """
+
+    def test_the_xrp_window_observed_live_is_reproducible(self):
+        """XRP 1:25-1:30 on 2026-08-15, the operator's example.
+
+            +69s  Up   0.47  $4.37   9.0sh -> cost $ 4.37  guaranteed $ 0.00
+           +112s  Up   0.78  $4.95   6.2sh -> cost $ 9.32  guaranteed $ 0.00
+           +130s  Down 0.22  $8.81  38.5sh -> cost $18.13  guaranteed $15.21
+           +153s  Up   0.82  $9.13  11.0sh -> cost $27.26  guaranteed $26.21
+
+        The third fill is the one a flat clip could never produce: 38.5 shares,
+        sized from the imbalance, taking guaranteed payout from nothing to most
+        of the cost.
+        """
+        s = build()
+        st = s.state_for("xrp-updown-5m-1")
+        st.record("up", 4.37, 9.0, NOW - 90)
+        st.record("up", 4.95, 6.2, NOW - 47)
+        self.assertAlmostEqual(st.cost_usd, 9.32, places=2)
+
+        bal = s.balance_for(st, "down", 0.22)
+        self.assertIsNotNone(bal, "should want to balance a 15.2-share Up book")
+        size_usd, worst = bal
+        q = s.all_in_cost(0.22)
+        # Buys the full 15.2-share shortfall, not a $5 clip.
+        self.assertAlmostEqual(size_usd, 15.2 * q, places=2)
+        self.assertGreater(size_usd, 3.0)
+        # And lands close to break-even rather than deepening the hole.
+        self.assertGreater(worst, -0.05 * (st.cost_usd + size_usd))
+
+    def test_balancing_is_refused_when_it_would_deepen_the_hole(self):
+        """The ETH 15m window the same hour ran to a -35% worst case."""
+        s = build()
+        st = s.state_for("eth-updown-15m-1")
+        st.record("up", 51.81, 70.3, NOW - 200)
+        st.record("down", 20.0, 27.9, NOW - 100)
+        # Topping the Down leg up to 70.3 shares at 78c costs far more than the
+        # $70.30 it could ever return.
+        self.assertIsNone(s.balance_for(st, "down", 0.78))
+
+    def test_a_lock_on_the_other_side_outranks_a_directional_edge(self):
+        """The gap that kept the clone one-sided.
+
+        When the model still prefers the side already held, the old code never
+        asked whether buying the OTHER side would lock the window — so it kept
+        adding to its favourite and switched on 4.8% of fills where the wallet
+        is two-sided on 52% of windows.
+        """
+        s = build()
+        # Holds 20 Up for $6.00 (a 30c basis) and the drift still favours Up,
+        # so the edge comparison would pick Up again.
+        m = market(up_ask=0.55, down_ask=0.11)
+        s.record_fill(m.slug, "up", 6.0, 20.0, "open", NOW - 60)
+        favoured = s.evaluate(m, spot(drift_ratio=1.0012), NOW)
+        self.assertEqual(favoured.side, "down", "should take the lock, not add")
+        self.assertTrue(favoured.is_lock)
+        self.assertIsNone(favoured.reason, favoured.reason)
+
+    def test_no_lock_means_the_edge_pick_stands(self):
+        s = build()
+        m = market(up_ask=0.55, down_ask=0.44)
+        s.record_fill(m.slug, "up", 11.0, 20.0, "open", NOW - 60)
+        intent = s.evaluate(m, spot(drift_ratio=1.0012), NOW)
+        self.assertEqual(intent.side, "up")
+        self.assertFalse(intent.is_lock)
+
+    def test_a_strict_lock_is_preferred_over_balancing(self):
+        s = build()
+        m = market(up_ask=0.60, down_ask=0.11)
+        s.record_fill(m.slug, "up", 6.0, 20.0, "open", NOW - 60)
+        intent = s.evaluate(m, spot(drift_ratio=0.9985), NOW)
+        self.assertEqual(intent.side, "down")
+        self.assertTrue(intent.is_lock)
+        self.assertFalse(intent.balancing)
+
+    def test_balancing_bypasses_the_model_gates(self):
+        """A balancing leg is bounded near break-even by construction, so the
+        gates that decide when the *forecast* is trustworthy do not apply."""
+        s = build()
+        st = s.state_for("x")
+        st.record("up", 4.37, 9.0, NOW - 90)
+        bal = s.balance_for(st, "down", 0.30)
+        self.assertIsNotNone(bal)
+        intent = Intent(
+            slug="x", asset="btc", window="5m", side="down",
+            size_usd=bal[0], limit_price=0.30, stage="hedge", fill_index=1,
+            confidence=0.05, edge=-0.40, drift_bps=0.0,
+            seconds_into_window=60.0, ask_depth_usd=50.0, balancing=True,
+        )
+        self.assertTrue(intent.model_independent)
+        self.assertFalse(intent.is_lock)
+
+    def test_balancing_can_be_switched_off(self):
+        s = build(balance_enabled=False)
+        st = s.state_for("x")
+        st.record("up", 4.37, 9.0, NOW - 90)
+        m = market(up_ask=0.60, down_ask=0.30)
+        s.record_fill(m.slug, "up", 4.37, 9.0, "open", NOW - 90)
+        intent = s.evaluate(m, spot(drift_ratio=0.9995), NOW)
+        self.assertFalse(intent.balancing)
+
+
+class DepthGuardTests(unittest.TestCase):
+    """Depth matters relative to the order, not absolutely."""
+
+    def _needed(self, s, size_usd):
+        return min(s.min_depth_usd, size_usd * s.depth_multiple)
+
+    def test_a_tiny_order_does_not_need_the_full_floor(self):
+        s = build(min_depth_usd=25.0, depth_multiple=5.0)
+        # A $0.05 longshot needs $0.25 of book, not $25.
+        self.assertAlmostEqual(self._needed(s, 0.05), 0.25)
+
+    def test_a_full_clip_still_wants_real_depth(self):
+        s = build(min_depth_usd=25.0, depth_multiple=5.0)
+        # A $5 clip wants 5x itself, capped at the configured floor.
+        self.assertAlmostEqual(self._needed(s, 5.0), 25.0)
+        self.assertAlmostEqual(self._needed(s, 100.0), 25.0)
+
+    def test_a_thin_book_still_rejects_a_full_clip(self):
+        s = build(min_depth_usd=25.0, depth_multiple=5.0)
+        m = market(up_ask=0.50, down_ask=0.99, depth=4.0)
+        intent = s.evaluate(m, spot(drift_ratio=1.0005), NOW)
+        self.assertIsNotNone(intent)
+        self.assertIn("depth", (intent.reason or ""))
 
 
 class ExposureTests(unittest.TestCase):

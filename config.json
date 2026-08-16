@@ -70,6 +70,13 @@
     "_lock_note": "Holding s_other shares of the opposite side for a total window cost c, and able to buy this side at an all-in q per share, buying n more gives a guaranteed min(s_other, s_this+n) against c + n*q. Below the balance point profit rises with n; past it the payout stops growing while the cost does not. The optimum is exactly the shortfall (s_other - s_this), which is why a third fill into an already two-sided window can still create a lock. When one exists the order is sized to take it and the combined-cost ceiling is bypassed, because a lock needs no further justification.",
     "lock_when_available": true,
     "min_lock_profit_usd": 0.10,
+
+    "_balance_note": "Only 7.31% of the wallet's two-sided windows finish as strict locks, but walked fill-by-fill it is visibly STEERING windows toward one. XRP 1:25-1:30 on 2026-08-15: Up 0.47 $4.37 (9.0sh), Up 0.78 $4.95 (6.2sh) -> cost $9.32 guaranteed $0.00; then Down 0.22 $8.81 for 38.5 SHARES -> cost $18.13 guaranteed $15.21; then Up 0.82 $9.13 -> cost $27.26 guaranteed $26.21. Finishes at a -$1.05 worst case against +$11.20 upside. A flat clip cannot do that — the size has to come from the imbalance. Balancing unconditionally is what makes the wallet's hedging lose money (-3.11% over 52,816 windows), so it is allowed only while the resulting worst case stays within max_worst_case_loss_frac of total cost. The XRP window lands at -3.9%; the ETH 15m window the same hour ran to -35% and is exactly what this refuses.",
+    "balance_enabled": true,
+    "max_worst_case_loss_frac": 0.05,
+
+    "_depth_note": "Depth matters relative to the order, not absolutely. A flat $25 floor demanded $25 of book to place a $0.05 longshot and refused precisely the thin cheap side a balancing leg needs — it was rejecting 1,514 entries at the 1c floor and 1,548 at the ceiling, which is the exact state a window is in when the wallet balances it. Required depth is now min(min_depth_usd, size * depth_multiple), so a $5 clip still wants $25 of book while a $0.05 order wants $0.25.",
+    "depth_multiple": 5.0,
     "_switching_note": "Confirmed against live activity 2026-08-15: BTC 1:25-1:30 went Up 71c -> Down 39c -> Down 39c -> Down 12c, and XRP 1:25-1:30 went Down 34c -> Up 67c -> Down 37c -> Down 51c -> Up 34c inside about a minute. It switches sides freely and repeatedly, and once it holds both sides it simply adds to whichever it currently likes. One confirming scan, not two: at a 3s poll a two-tick confirmation costs 6s per switch, which is most of the move on a 300s window.",
     "hedge_enabled": true,
     "hedge_after_adverse_ticks": 1,
